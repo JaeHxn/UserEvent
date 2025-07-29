@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  # 메인 애플리케이션 서비스
+  main-app:
+    build: .
+    container_name: user-events-main-app
+    ports:
+      - "7070:7070"
+    volumes:
+      - ./data:/app/data
+      - ./lightgcn_data:/app/lightgcn_data
+      - ./user_events.db:/app/user_events.db
+      - ./logs:/app/logs
+    environment:
+      - FLASK_APP=app.py
+      - FLASK_ENV=production
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MILVUS_HOST=${MILVUS_HOST:-114.110.135.96}
+      - MILVUS_PORT=${MILVUS_PORT:-19530}
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=${SERVER_PORT:-7070}
+      - ADMIN_PORT=${ADMIN_PORT:-7071}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+    env_file:
+      - .env
+    command: python app.py
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7070/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+  # 관리자 대시보드 서비스
+  admin-dashboard:
+    build: .
+    container_name: user-events-admin-dashboard
+    ports:
+      - "7071:7071"
+    volumes:
+      - ./data:/app/data
+      - ./lightgcn_data:/app/lightgcn_data
+      - ./user_events.db:/app/user_events.db
+      - ./logs:/app/logs
+    environment:
+      - FLASK_APP=admin_dashboard.py
+      - FLASK_ENV=production
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=${SERVER_PORT:-7070}
+      - ADMIN_PORT=${ADMIN_PORT:-7071}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+    env_file:
+      - .env
+    command: python admin_dashboard.py
+    restart: unless-stopped
+    depends_on:
+      - main-app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7071/admin"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+  # Nginx 리버스 프록시 (선택사항)
+  nginx:
+    image: nginx:alpine
+    container_name: user-events-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - main-app
+      - admin-dashboard
+    restart: unless-stopped
+    networks:
+      - app-network
+
+volumes:
+  data:
+    driver: local
+  lightgcn_data:
+    driver: local
+  logs:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge 

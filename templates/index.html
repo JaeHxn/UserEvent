@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>AI 상품 추천</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Roboto', 'Noto Sans KR', Arial, sans-serif;
+            background: linear-gradient(120deg, #e0e7ff 0%, #f8fafc 100%);
+            margin: 0; padding: 0;
+        }
+        .container {
+            max-width: 900px;
+            margin: 40px auto;
+            background: #fff;
+            border-radius: 18px;
+            box-shadow: 0 4px 24px #0002;
+            padding: 40px 32px 32px 32px;
+        }
+        h1 {
+            text-align: center;
+            color: #2d3a5a;
+            margin-bottom: 8px;
+            font-size: 2.3em;
+        }
+        .subtitle {
+            text-align: center;
+            color: #64748b;
+            margin-bottom: 32px;
+            font-size: 1.1em;
+        }
+        form {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 18px;
+            justify-content: center;
+            margin-bottom: 36px;
+        }
+        .form-group {
+            flex: 1 1 180px;
+            min-width: 180px;
+            max-width: 260px;
+        }
+        label {
+            font-weight: 700;
+            color: #475569;
+            margin-bottom: 4px;
+            display: block;
+        }
+        input, select {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 6px;
+            border: 1px solid #cbd5e1;
+            font-size: 1em;
+            background: #f1f5f9;
+            margin-bottom: 2px;
+            transition: border 0.2s;
+        }
+        input:focus {
+            border: 1.5px solid #6366f1;
+            outline: none;
+        }
+        button {
+            flex: 1 1 120px;
+            min-width: 120px;
+            padding: 12px 0;
+            background: linear-gradient(90deg, #6366f1 60%, #60a5fa 100%);
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 1.1em;
+            font-weight: 700;
+            cursor: pointer;
+            box-shadow: 0 2px 8px #6366f133;
+            transition: background 0.2s, box-shadow 0.2s;
+        }
+        button:hover {
+            background: linear-gradient(90deg, #4338ca 60%, #2563eb 100%);
+            box-shadow: 0 4px 16px #6366f155;
+        }
+        .error {
+            color: #e11d48;
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 18px;
+            text-align: center;
+        }
+        .results {
+            margin-top: 32px;
+        }
+        .cards {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 24px;
+            justify-content: center;
+        }
+        .card {
+            background: #f8fafc;
+            border-radius: 14px;
+            box-shadow: 0 2px 12px #6366f122;
+            width: 260px;
+            padding: 20px 18px 18px 18px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            transition: box-shadow 0.2s, transform 0.2s;
+            position: relative;
+        }
+        .card:hover {
+            box-shadow: 0 8px 32px #6366f144;
+            transform: translateY(-4px) scale(1.03);
+        }
+        .card img {
+            width: 120px;
+            height: 120px;
+            object-fit: contain;
+            border-radius: 10px;
+            background: #e0e7ff;
+            margin-bottom: 14px;
+        }
+        .card-title {
+            font-size: 1.1em;
+            font-weight: 700;
+            color: #334155;
+            margin-bottom: 6px;
+            text-align: center;
+        }
+        .card-category {
+            color: #6366f1;
+            font-size: 0.98em;
+            margin-bottom: 8px;
+        }
+        .card-price {
+            color: #0ea5e9;
+            font-size: 1.15em;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+        .card-code {
+            color: #64748b;
+            font-size: 0.93em;
+            margin-bottom: 10px;
+        }
+        .card-link a {
+            display: inline-block;
+            background: #6366f1;
+            color: #fff;
+            padding: 7px 18px;
+            border-radius: 5px;
+            text-decoration: none;
+            font-weight: 700;
+            font-size: 0.98em;
+            transition: background 0.2s;
+        }
+        .card-link a:hover {
+            background: #2563eb;
+        }
+        @media (max-width: 900px) {
+            .container { padding: 18px 2vw; }
+            .cards { gap: 14px; }
+            .card { width: 44vw; min-width: 180px; max-width: 320px; }
+        }
+        @media (max-width: 600px) {
+            .container { padding: 8px 0; }
+            .card { width: 98vw; min-width: 0; max-width: 100vw; }
+        }
+        .empty {
+            text-align: center;
+            color: #64748b;
+            font-size: 1.1em;
+            margin-top: 32px;
+        }
+        .loader {
+            display: none;
+            margin: 0 auto 18px auto;
+            border: 6px solid #e0e7ff;
+            border-top: 6px solid #6366f1;
+            border-radius: 50%;
+            width: 44px;
+            height: 44px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+    <script>
+        function showLoader() {
+            document.getElementById('loader').style.display = 'block';
+        }
+        
+        // 페이지 로드 시 폼 초기화 (새로고침 방지)
+        document.addEventListener('DOMContentLoaded', function() {
+            // 새로고침 감지 (여러 방법 사용)
+            const isRefresh = performance.navigation.type === 1 || 
+                             performance.getEntriesByType('navigation')[0]?.type === 'reload' ||
+                             document.referrer === '';
+            
+            if (isRefresh) {
+                // 새로고침인 경우 폼 필드 초기화
+                document.getElementById('query').value = '';
+                document.getElementById('price_min').value = '';
+                document.getElementById('price_max').value = '';
+                
+                // URL에서 쿼리 파라미터 제거 (있다면)
+                if (window.history.replaceState) {
+                    window.history.replaceState({}, document.title, window.location.pathname);
+                }
+            }
+        });
+        
+        // 페이지를 떠날 때 폼 데이터 초기화
+        window.addEventListener('beforeunload', function() {
+            // 폼 필드 초기화
+            document.getElementById('query').value = '';
+            document.getElementById('price_min').value = '';
+            document.getElementById('price_max').value = '';
+        });
+        
+        // 상품 상세보기 클릭 이벤트 추적
+        function trackProductView(productData) {
+            fetch('/track_view', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    product_code: productData.상품코드,
+                    product_data: productData
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    console.log('상품 조회 이벤트 기록됨:', data.view_id);
+                } else {
+                    console.error('이벤트 기록 실패:', data.message);
+                }
+            })
+            .catch(error => {
+                console.error('이벤트 추적 오류:', error);
+            });
+        }
+        
+        // 상세보기 링크 클릭 시 이벤트 추적 (data 속성 사용)
+        function handleDetailViewClickFromData(element, event) {
+            // data 속성에서 상품 정보 가져오기
+            const productData = {
+                상품코드: element.getAttribute('data-product-code'),
+                제목: element.getAttribute('data-product-name'),
+                카테고리: element.getAttribute('data-category'),
+                가격: parseInt(element.getAttribute('data-price'))
+            };
+            
+            // 이벤트 추적
+            trackProductView(productData);
+            
+            // 원래 링크 동작 수행 (새 탭에서 열기)
+            event.preventDefault();
+            window.open(element.href, '_blank');
+        }
+    </script>
+</head>
+<body>
+<div class="container">
+    <h1>AI 상품 추천</h1>
+    <div class="subtitle">AI가 내 검색어와 조건에 맞는 상품을 똑똑하게 추천해줍니다.</div>
+    <form method="post" onsubmit="showLoader()">
+        <div class="form-group">
+            <label for="query">검색어</label>
+                            <input type="text" id="query" name="query" placeholder="예: 방수 등산화 8사이즈" required>
+        </div>
+        <div class="form-group">
+            <label for="price_min">최소 가격</label>
+                            <input type="number" id="price_min" name="price_min" placeholder="예: 10000">
+        </div>
+        <div class="form-group">
+            <label for="price_max">최대 가격</label>
+                            <input type="number" id="price_max" name="price_max" placeholder="예: 100000">
+        </div>
+        <button type="submit">추천 검색</button>
+    </form>
+    <div id="loader" class="loader"></div>
+    {% if error %}
+        <div class="error">
+            <strong>⚠️ {{ error }}</strong><br>
+            <span style="color:#64748b; font-size:0.98em;">실제 추천 서버(API)가 연결되지 않아 예시 데이터로 결과가 표시되고 있습니다.<br>정상 추천 결과를 원하시면 서버 상태를 확인해 주세요.</span>
+        </div>
+    {% endif %}
+    <div class="results">
+    {% if results %}
+        {% if results|length == 0 %}
+            <div class="empty">조건에 맞는 상품이 없습니다.<br>검색어 또는 조건을 바꿔 다시 시도해보세요.</div>
+        {% else %}
+        <div class="cards">
+            {% for item in results %}
+            <div class="card">
+                <div style="position:relative; width:120px; height:120px; margin-bottom:14px;">
+                    <img src="{{ item.이미지 }}" alt="이미지" style="width:120px; height:120px; object-fit:contain; border-radius:10px; background:#e0e7ff;">
+                    {% if item.상품링크 %}
+                    <a href="{{ item.상품링크 }}" 
+                       data-product-code="{{ item.상품코드 }}"
+                       data-product-name="{{ item.제목 }}"
+                       data-category="{{ item.카테고리 }}"
+                       data-price="{{ item.가격 }}"
+                       onclick="handleDetailViewClickFromData(this, event)" 
+                       style="position:absolute; bottom:8px; right:8px; background:rgba(99,102,241,0.92); color:#fff; padding:4px 12px; border-radius:5px; text-decoration:none; font-weight:700; font-size:0.93em; box-shadow:0 2px 8px #6366f133;">상세보기</a>
+                    {% endif %}
+                </div>
+                <div class="card-title">{{ item.제목 }}</div>
+                <div class="card-category">{{ item.카테고리 }}</div>
+                <div class="card-price">{{ '{:,}'.format(item.가격) }}원{% if item.배송비 and item.배송비 > 0 %} <span style="color:#64748b; font-size:0.95em;">+ 배송비 {{ '{:,}'.format(item.배송비) }}원</span>{% endif %}</div>
+                <div class="card-code">상품코드: {{ item.상품코드 }}</div>
+                <div style="color:#64748b; font-size:0.97em; margin-bottom:4px;">원산지: {{ item.원산지 }}</div>
+                {% if item.옵션 and item.옵션 != '없음' %}
+                <div style="color:#6366f1; font-size:0.97em; margin-bottom:4px; white-space:pre-line;">옵션: {{ item.옵션 }}</div>
+                {% endif %}
+                {% if item.최대구매수량 %}
+                <div style="color:#64748b; font-size:0.95em;">최대구매수량: {{ item.최대구매수량 }}</div>
+                {% endif %}
+                <div style="margin-top:10px; display:flex; gap:8px; justify-content:center;">
+                    <a href="{{ item.상품링크 }}" target="_blank" style="background:#22c55e; color:#fff; padding:7px 14px; border-radius:5px; text-decoration:none; font-weight:700; font-size:0.97em;">구매하기(MCP)</a>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    {% endif %}
+    </div>
+</div>
+</body>
+</html> 

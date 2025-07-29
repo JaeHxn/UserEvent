@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # 메인 애플리케이션 서비스 (개발용)
+  main-app:
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=true
+      - ENVIRONMENT=development
+      - SERVER_HOST=localhost
+      - SERVER_PORT=7070
+      - ADMIN_PORT=7071
+    volumes:
+      - .:/app
+    ports:
+      - "7070:7070"
+    command: python app.py
+
+  # 관리자 대시보드 서비스 (개발용)
+  admin-dashboard:
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=true
+      - ENVIRONMENT=development
+      - SERVER_HOST=localhost
+      - SERVER_PORT=7070
+      - ADMIN_PORT=7071
+    volumes:
+      - .:/app
+    ports:
+      - "7071:7071"
+    command: python admin_dashboard.py
+
+  # 개발용 데이터베이스 (선택사항)
+  # postgres:
+  #   image: postgres:13
+  #   environment:
+  #     POSTGRES_DB: user_events_dev
+  #     POSTGRES_USER: dev_user
+  #     POSTGRES_PASSWORD: dev_password
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+
+  # 개발용 Redis (선택사항)
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   command: redis-server --appendonly yes
+
+# volumes:
+#   postgres_data:
+#     driver: local 
