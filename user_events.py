@@ -92,6 +92,11 @@ class UserEventManager:
         """사용자 ID를 가져오거나 새로 생성"""
         # 세션 ID를 기반으로 사용자 ID 생성 (해시)
         user_id = hashlib.md5(session_id.encode()).hexdigest()[:16]
+
+        #ID는 불러오는 곳을 유동적으로 바꿀 수 있음. 
+        # user_id = authenticated_user_id  # 예: "user_123" 또는 실제 DB의 user PK
+        # user_id = facebook_user_id  # 예: "123456789"   페이스북의 실제 UID
+
         korean_time = self.get_korean_time()
         
         conn = sqlite3.connect(self.db_path)
@@ -124,44 +129,103 @@ class UserEventManager:
         event_id = str(uuid.uuid4())
         view_id = str(uuid.uuid4())
         korean_time = self.get_korean_time()
+        conn = None
         
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # 상품 상세보기 이벤트 기록
-        cursor.execute('''
-            INSERT INTO product_views (
-                view_id, user_id, product_code, product_name, category, 
-                price, ip_address, user_agent, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            view_id, user_id, 
-            product_data.get('상품코드', ''),
-            product_data.get('제목', ''),
-            product_data.get('카테고리', ''),
-            product_data.get('가격', 0),
-            ip_address, user_agent, korean_time
-        ))
-        
-        # 일반 이벤트 테이블에도 기록
-        metadata = json.dumps(product_data, ensure_ascii=False)
-        cursor.execute('''
-            INSERT INTO user_events (
-                event_id, user_id, session_id, event_type, product_code,
-                product_name, category, price, metadata, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            event_id, user_id, session_id, 'product_view',
-            product_data.get('상품코드', ''),
-            product_data.get('제목', ''),
-            product_data.get('카테고리', ''),
-            product_data.get('가격', 0),
-            metadata, korean_time
-        ))
-        
-        conn.commit()
-        conn.close()
-        return view_id
+        try:
+            print(f"[DEBUG] ===== 상품 조회 이벤트 기록 시작 =====")
+            print(f"[DEBUG] view_id: {view_id}")
+            print(f"[DEBUG] product_code: {product_data.get('상품코드', '')}")
+            print(f"[DEBUG] time: {korean_time}")
+            print(f"[DEBUG] user_id: {user_id}")
+            
+            conn = sqlite3.connect(self.db_path)
+            conn.isolation_level = None  # 자동 커밋 모드
+            cursor = conn.cursor()
+            
+            try:
+                # 트랜잭션 시작
+                cursor.execute('BEGIN')
+                
+                # 최근 30분 이내 같은 상품 조회 여부 확인
+                cursor.execute('''
+                    SELECT timestamp FROM product_views 
+                    WHERE user_id = ? AND product_code = ? 
+                    AND timestamp >= datetime('now', '-30 minutes')
+                    ORDER BY timestamp DESC LIMIT 1
+                ''', (user_id, product_data.get('상품코드', '')))
+                
+                recent_view = cursor.fetchone()
+                
+                if not recent_view:
+                    # 상품 조회 기록
+                    print("[DEBUG] product_views 테이블 삽입 시작")
+                    cursor.execute('''
+                        INSERT INTO product_views (
+                            view_id, user_id, product_code, product_name, category, 
+                            price, ip_address, user_agent, timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        view_id, user_id, 
+                        product_data.get('상품코드', ''),
+                        product_data.get('제목', ''),
+                        product_data.get('카테고리', ''),
+                        product_data.get('가격', 0),
+                        ip_address, user_agent, korean_time
+                    ))
+                    print("[DEBUG] product_views 테이블 삽입 완료")
+                    
+                    # 일반 이벤트 테이블 기록
+                    print("[DEBUG] user_events 테이블 삽입 시작")
+                    metadata = json.dumps(product_data, ensure_ascii=False)
+                    cursor.execute('''
+                        INSERT INTO user_events (
+                            event_id, user_id, session_id, event_type, product_code,
+                            product_name, category, price, metadata, timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        event_id, user_id, session_id, 'product_view',
+                        product_data.get('상품코드', ''),
+                        product_data.get('제목', ''),
+                        product_data.get('카테고리', ''),
+                        product_data.get('가격', 0),
+                        metadata, korean_time
+                    ))
+                    print("[DEBUG] user_events 테이블 삽입 완료")
+                    
+                # 트랜잭션 커밋
+                print("[DEBUG] 트랜잭션 커밋 시작")
+                cursor.execute('COMMIT')
+                print("[DEBUG] 트랜잭션 커밋 완료")
+                
+                # 저장 확인
+                cursor.execute('''
+                    SELECT product_code, timestamp 
+                    FROM product_views 
+                    WHERE view_id = ?
+                ''', (view_id,))
+                saved_data = cursor.fetchone()
+                print(f"[DEBUG] 저장 확인: {saved_data}")
+                
+                print("[DEBUG] ===== 상품 조회 이벤트 기록 완료 =====")
+                return view_id
+                
+            except Exception as e:
+                # 오류 발생시 롤백
+                print(f"[ERROR] DB 작업 중 오류 발생: {str(e)}")
+                cursor.execute('ROLLBACK')
+                raise
+                
+        except Exception as e:
+            print(f"[ERROR] 상품 조회 이벤트 기록 실패: {str(e)}")
+            raise
+            
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                    print("[DEBUG] DB 연결 종료")
+                except Exception as e:
+                    print(f"[ERROR] DB 연결 종료 실패: {str(e)}")
     
     def record_search_event(self, user_id: str, session_id: str, query: str, 
                            price_min: int = None, price_max: int = None,

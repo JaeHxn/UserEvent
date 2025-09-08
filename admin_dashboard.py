@@ -1,4 +1,7 @@
-from flask import Flask, render_template, jsonify, request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from jinja2 import Environment, FileSystemLoader
+from pydantic import BaseModel
 import sqlite3
 from user_events import event_manager
 from lightgcn_data_prep import LightGCNDataPreprocessor
@@ -6,15 +9,21 @@ import json
 import os
 from datetime import datetime, timedelta
 
-app = Flask(__name__)
+app = FastAPI(title="관리자 대시보드", version="1.0.0")
+templates = Environment(loader=FileSystemLoader("templates"))
 
-@app.route('/admin')
-def admin_dashboard():
+# Pydantic 모델 정의
+class ResetStatisticsData(BaseModel):
+    confirm: bool = False
+
+@app.get('/admin', response_class=HTMLResponse)
+async def admin_dashboard(request: Request):
     """관리자 대시보드 페이지"""
-    return render_template('admin_dashboard.html')
+    template = templates.get_template("admin_dashboard.html")
+    return HTMLResponse(template.render(request=request))
 
-@app.route('/api/stats')
-def get_statistics():
+@app.get('/api/stats')
+async def get_statistics():
     """전체 통계 API"""
     try:
         conn = sqlite3.connect(event_manager.db_path)
@@ -32,17 +41,17 @@ def get_statistics():
         cursor.execute('SELECT COUNT(*) FROM search_events')
         total_searches = cursor.fetchone()[0]
         
-        # 오늘 상품 조회 수
-        cursor.execute('SELECT COUNT(*) FROM product_views WHERE DATE(timestamp) = DATE("now")')
+        # 오늘 상품 조회 수 (2025년 9월 2일 기준)
+        cursor.execute('SELECT COUNT(*) FROM product_views WHERE DATE(timestamp) = "2025-09-02"')
         today_views = cursor.fetchone()[0]
         
-        # 오늘 검색 수
-        cursor.execute('SELECT COUNT(*) FROM search_events WHERE DATE(timestamp) = DATE("now")')
+        # 오늘 검색 수 (2025년 9월 2일 기준)
+        cursor.execute('SELECT COUNT(*) FROM search_events WHERE DATE(timestamp) = "2025-09-02"')
         today_searches = cursor.fetchone()[0]
         
         conn.close()
         
-        return jsonify({
+        return JSONResponse({
             'status': 'success',
             'data': {
                 'total_users': total_users,
@@ -53,24 +62,21 @@ def get_statistics():
             }
         })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/popular_products')
-def get_popular_products():
+@app.get('/api/popular_products')
+async def get_popular_products(days: int = 7):
     """인기 상품 API"""
     try:
-        days = request.args.get('days', 7, type=int)
         popular_products = event_manager.get_popular_products(days=days, limit=20)
-        return jsonify({'status': 'success', 'data': popular_products})
+        return JSONResponse({'status': 'success', 'data': popular_products})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/user_activity')
-def get_user_activity():
+@app.get('/api/user_activity')
+async def get_user_activity(days: int = 7):
     """사용자 활동 추이 API"""
     try:
-        days = request.args.get('days', 7, type=int)
-        
         conn = sqlite3.connect(event_manager.db_path)
         cursor = conn.cursor()
         
@@ -78,19 +84,20 @@ def get_user_activity():
         cursor.execute('''
             SELECT DATE(timestamp) as date, COUNT(*) as view_count
             FROM product_views 
-            WHERE timestamp >= datetime('now', '-{} days')
+            WHERE timestamp >= "2025-09-02"
             GROUP BY DATE(timestamp)
             ORDER BY date
         '''.format(days))
         
         daily_views = [{'date': row[0], 'count': row[1]} for row in cursor.fetchall()]
         
-        # 일별 검색 수
+        # 일별 검색 수 (한국 시간 기준)
         cursor.execute('''
-            SELECT DATE(timestamp) as date, COUNT(*) as search_count
+            SELECT strftime('%Y-%m-%d', timestamp) as date, 
+                   COUNT(*) as search_count
             FROM search_events 
-            WHERE timestamp >= datetime('now', '-{} days')
-            GROUP BY DATE(timestamp)
+            WHERE DATE(timestamp) >= "2025-09-02"
+            GROUP BY strftime('%Y-%m-%d', timestamp)
             ORDER BY date
         '''.format(days))
         
@@ -100,7 +107,7 @@ def get_user_activity():
         cursor.execute('''
             SELECT strftime('%H', timestamp) as hour, COUNT(*) as count
             FROM product_views 
-            WHERE DATE(timestamp) = DATE('now')
+            WHERE DATE(timestamp) = "2025-09-02"
             GROUP BY strftime('%H', timestamp)
             ORDER BY hour
         ''')
@@ -109,7 +116,7 @@ def get_user_activity():
         
         conn.close()
         
-        return jsonify({
+        return JSONResponse({
             'status': 'success',
             'data': {
                 'daily_views': daily_views,
@@ -118,21 +125,19 @@ def get_user_activity():
             }
         })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/category_stats')
-def get_category_stats():
+@app.get('/api/category_stats')
+async def get_category_stats(days: int = None):
     """카테고리별 통계 API"""
     try:
-        days = request.args.get('days', None, type=int)
-        
         conn = sqlite3.connect(event_manager.db_path)
         cursor = conn.cursor()
         
         # 기간 필터 조건
         date_filter = ""
         if days:
-            date_filter = f"WHERE timestamp >= datetime('now', '-{days} days') AND category != '' AND category IS NOT NULL"
+            date_filter = f"WHERE timestamp >= '2025-09-02' AND category != '' AND category IS NOT NULL"
         else:
             date_filter = "WHERE category != '' AND category IS NOT NULL"
         
@@ -150,19 +155,16 @@ def get_category_stats():
         
         conn.close()
         
-        return jsonify({'status': 'success', 'data': category_stats})
+        return JSONResponse({'status': 'success', 'data': category_stats})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/reset_statistics', methods=['POST'])
-def reset_statistics():
+@app.post('/api/reset_statistics')
+async def reset_statistics(data: ResetStatisticsData):
     """통계 데이터 초기화 API"""
     try:
-        # 확인을 위한 파라미터
-        confirm = request.json.get('confirm', False)
-        
-        if not confirm:
-            return jsonify({'status': 'error', 'message': '확인 파라미터가 필요합니다.'}), 400
+        if not data.confirm:
+            raise HTTPException(status_code=400, detail='확인 파라미터가 필요합니다.')
         
         conn = sqlite3.connect(event_manager.db_path)
         cursor = conn.cursor()
@@ -179,18 +181,17 @@ def reset_statistics():
         conn.commit()
         conn.close()
         
-        return jsonify({
+        return JSONResponse({
             'status': 'success', 
             'message': '모든 통계 데이터가 성공적으로 초기화되었습니다.'
         })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/period_stats')
-def get_period_statistics():
+@app.get('/api/period_stats')
+async def get_period_statistics(days: int = 7):
     """기간별 통계 API"""
     try:
-        days = request.args.get('days', 7, type=int)
         
         conn = sqlite3.connect(event_manager.db_path)
         cursor = conn.cursor()
@@ -217,7 +218,7 @@ def get_period_statistics():
         cursor.execute('''
             SELECT COUNT(*) as search_count
             FROM search_events 
-            WHERE timestamp >= datetime('now', '-{} days')
+            WHERE datetime(timestamp, '+9 hours') >= datetime('now', '+9 hours', '-{} days')
         '''.format(days))
         
         period_searches = cursor.fetchone()[0]
@@ -258,7 +259,7 @@ def get_period_statistics():
         
         conn.close()
         
-        return jsonify({
+        return JSONResponse({
             'status': 'success',
             'data': {
                 'period_days': days,
@@ -272,19 +273,19 @@ def get_period_statistics():
             }
         })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/lightgcn_data')
-def get_lightgcn_data():
+@app.get('/api/lightgcn_data')
+async def get_lightgcn_data():
     """LightGCN 데이터 상태 확인 API"""
     try:
         preprocessor = LightGCNDataPreprocessor()
         data = preprocessor.load_lightgcn_data()
         
         if not data:
-            return jsonify({'status': 'error', 'message': 'LightGCN 데이터가 없습니다.'})
+            raise HTTPException(status_code=404, detail='LightGCN 데이터가 없습니다.')
         
-        return jsonify({
+        return JSONResponse({
             'status': 'success',
             'data': {
                 'n_users': data.get('n_users', 0),
@@ -294,19 +295,17 @@ def get_lightgcn_data():
             }
         })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/regenerate_lightgcn_data')
-def regenerate_lightgcn_data():
+@app.get('/api/regenerate_lightgcn_data')
+async def regenerate_lightgcn_data(min_interactions: int = 3):
     """LightGCN 데이터 재생성 API"""
     try:
-        min_interactions = request.args.get('min_interactions', 3, type=int)
-        
         preprocessor = LightGCNDataPreprocessor()
         data = preprocessor.prepare_lightgcn_data(min_interactions=min_interactions)
         
         if data:
-            return jsonify({
+            return JSONResponse({
                 'status': 'success',
                 'message': 'LightGCN 데이터가 성공적으로 재생성되었습니다.',
                 'data': {
@@ -316,12 +315,12 @@ def regenerate_lightgcn_data():
                 }
             })
         else:
-            return jsonify({'status': 'error', 'message': '데이터가 충분하지 않습니다.'})
+            raise HTTPException(status_code=400, detail='데이터가 충분하지 않습니다.')
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/user_details/<user_id>')
-def get_user_details(user_id):
+@app.get('/api/user_details/{user_id}')
+async def get_user_details(user_id: str):
     """사용자 상세 정보 API"""
     try:
         conn = sqlite3.connect(event_manager.db_path)
@@ -335,7 +334,7 @@ def get_user_details(user_id):
         
         user_info = cursor.fetchone()
         if not user_info:
-            return jsonify({'status': 'error', 'message': '사용자를 찾을 수 없습니다.'}), 404
+            raise HTTPException(status_code=404, detail='사용자를 찾을 수 없습니다.')
         
         # 사용자 상품 조회 기록
         cursor.execute('''
@@ -379,7 +378,7 @@ def get_user_details(user_id):
         
         conn.close()
         
-        return jsonify({
+        return JSONResponse({
             'status': 'success',
             'data': {
                 'user_info': {
@@ -394,13 +393,15 @@ def get_user_details(user_id):
             }
         })
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == '__main__':
+    import uvicorn
+    
     # 환경 변수에서 설정 가져오기
     host = '0.0.0.0'
     port = 7071
-    debug = False
+    debug = True
     
-    print(f"🚀 관리자 대시보드 시작: {host}:{port} (debug={debug})")
-    app.run(host=host, port=port, debug=debug) 
+    print(f"🚀 FastAPI 관리자 대시보드 시작: {host}:{port} (debug={debug})")
+    uvicorn.run("admin_dashboard:app", host=host, port=port, reload=debug) 

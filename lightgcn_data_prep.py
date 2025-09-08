@@ -40,8 +40,11 @@ class LightGCNDataPreprocessor:
         
         return user_id_to_idx, product_code_to_idx
     
-    def prepare_lightgcn_data(self, min_interactions: int = 5) -> Dict[str, Any]:
-        """LightGCN용 데이터 준비"""
+    def prepare_lightgcn_data(self, min_interactions: int = 3) -> Dict[str, Any]:
+        """LightGCN용 데이터 준비
+        Args:
+            min_interactions (int): 최소 상호작용 횟수 (기본값: 1)
+        """
         print("사용자-상품 상호작용 데이터 로드 중...")
         df = self.load_user_interaction_data()
         
@@ -222,7 +225,7 @@ if __name__ == "__main__":
     preprocessor = LightGCNDataPreprocessor()
     
     # 데이터 준비
-    data = preprocessor.prepare_lightgcn_data(min_interactions=3)
+    data = preprocessor.prepare_lightgcn_data()
     
     if data:
         print(f"사용자 수: {data['n_users']}")

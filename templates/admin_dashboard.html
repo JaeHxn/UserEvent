@@ -178,28 +178,41 @@
         </div>
 
         <!-- 통계 카드 -->
-        <div class="stats-grid">
-            <div class="stat-card">
-                <h3>총 사용자 수</h3>
-                <div class="value" id="total-users">-</div>
+        <div class="stats-container" style="background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 2px 12px rgba(0,0,0,0.1);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3>기본 통계</h3>
+                <button class="button" onclick="loadStatistics()" style="padding: 8px 16px; font-size: 0.9em;">
+                    <span style="margin-right: 5px;">🔄</span> 새로고침
+                </button>
             </div>
-            <div class="stat-card">
-                <h3>총 상품 조회 수</h3>
-                <div class="value" id="total-views">-</div>
-            </div>
-            <div class="stat-card">
-                <h3>총 검색 수</h3>
-                <div class="value" id="total-searches">-</div>
-            </div>
-            <div class="stat-card">
-                <h3>오늘 상품 조회 수</h3>
-                <div class="value" id="today-views">-</div>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <h3>총 사용자 수</h3>
+                    <div class="value" id="total-users">-</div>
+                </div>
+                <div class="stat-card">
+                    <h3>총 상품 조회 수</h3>
+                    <div class="value" id="total-views">-</div>
+                </div>
+                <div class="stat-card">
+                    <h3>총 검색 수</h3>
+                    <div class="value" id="total-searches">-</div>
+                </div>
+                <div class="stat-card">
+                    <h3>오늘 상품 조회 수</h3>
+                    <div class="value" id="today-views">-</div>
+                </div>
             </div>
         </div>
 
         <!-- LightGCN 데이터 상태 -->
         <div class="chart-container">
-            <h3>LightGCN 데이터 상태</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3>LightGCN 데이터 상태</h3>
+                <button class="button" onclick="loadLightGCNStatus()" style="padding: 8px 16px; font-size: 0.9em;">
+                    <span style="margin-right: 5px;">🔄</span> 새로고침
+                </button>
+            </div>
             <div id="lightgcn-status">
                 <div class="loading">데이터 로딩 중...</div>
             </div>
@@ -207,7 +220,12 @@
 
         <!-- 사용자 활동 차트 -->
         <div class="chart-container">
-            <h3>사용자 활동 추이 (최근 7일)</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3>사용자 활동 추이 (최근 7일)</h3>
+                <button class="button" onclick="loadUserActivity()" style="padding: 8px 16px; font-size: 0.9em;">
+                    <span style="margin-right: 5px;">🔄</span> 새로고침
+                </button>
+            </div>
             <div class="chart-wrapper">
                 <canvas id="activityChart"></canvas>
             </div>
@@ -215,7 +233,12 @@
 
         <!-- 카테고리별 통계 -->
         <div class="chart-container">
-            <h3>카테고리별 상품 조회 수</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3>카테고리별 상품 조회 수</h3>
+                <button class="button" onclick="loadCategoryStats()" style="padding: 8px 16px; font-size: 0.9em;">
+                    <span style="margin-right: 5px;">🔄</span> 새로고침
+                </button>
+            </div>
             <div class="chart-wrapper">
                 <canvas id="categoryChart"></canvas>
             </div>
@@ -241,17 +264,14 @@
             <button class="button danger" onclick="showResetConfirm()">통계 데이터 초기화</button>
         </div>
 
-        <!-- 기간별 통계 섹션 -->
-        <div class="chart-container" id="period-stats-section" style="display: none;">
-            <h3>기간별 통계</h3>
-            <div id="period-stats-content">
-                <div class="loading">기간별 통계 로딩 중...</div>
-            </div>
-        </div>
-
         <!-- 인기 상품 테이블 -->
         <div class="table-container">
-            <h3>인기 상품 TOP 10</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3>인기 상품 TOP 10</h3>
+                <button class="button" onclick="loadPopularProducts()" style="padding: 8px 16px; font-size: 0.9em;">
+                    <span style="margin-right: 5px;">🔄</span> 새로고침
+                </button>
+            </div>
             <div id="popular-products">
                 <div class="loading">데이터 로딩 중...</div>
             </div>
@@ -374,10 +394,15 @@
         // 사용자 활동 차트 로드
         async function loadUserActivity() {
             try {
-                const response = await fetch('/api/user_activity?days=7');
+                const days = document.getElementById('period-select').value;
+                const response = await fetch(`/api/user_activity?days=${days}`);
                 const data = await response.json();
                 
                 if (data.status === 'success') {
+                    // 차트 제목 업데이트
+                    const chartTitle = document.querySelector('.chart-container h3');
+                    chartTitle.textContent = `사용자 활동 추이 (최근 ${days}일)`;
+                    
                     renderActivityChart(data.data);
                 }
             } catch (error) {
@@ -420,10 +445,15 @@
         // 카테고리 통계 차트 로드
         async function loadCategoryStats() {
             try {
-                const response = await fetch('/api/category_stats');
+                const days = document.getElementById('period-select').value;
+                const response = await fetch(`/api/category_stats?days=${days}`);
                 const data = await response.json();
                 
                 if (data.status === 'success') {
+                    // 차트 제목 업데이트
+                    const chartTitle = document.querySelector('.chart-container:nth-of-type(4) h3');
+                    chartTitle.textContent = `카테고리별 상품 조회 수 (최근 ${days}일)`;
+                    
                     renderCategoryChart(data.data);
                 }
             } catch (error) {
@@ -434,12 +464,17 @@
         // 인기 상품 로드
         async function loadPopularProducts() {
             try {
-                const response = await fetch('/api/popular_products?days=7&limit=10');
+                const days = document.getElementById('period-select').value;
+                const response = await fetch(`/api/popular_products?days=${days}&limit=10`);
                 const data = await response.json();
                 
                 const container = document.getElementById('popular-products');
                 
                 if (data.status === 'success') {
+                    // 제목 업데이트
+                    const title = document.querySelector('.table-container h3');
+                    title.textContent = `인기 상품 TOP 10 (최근 ${days}일)`;
+                    
                     const tableHTML = `
                         <table>
                             <thead>
@@ -483,7 +518,7 @@
             }
             
             try {
-                const response = await fetch('/api/regenerate_lightgcn_data?min_interactions=3');
+                const response = await fetch('/api/regenerate_lightgcn_data');
                 const data = await response.json();
                 
                 if (data.status === 'success') {
@@ -500,10 +535,18 @@
 
         // 통계 새로고침
         function refreshStats() {
-            loadStatistics();
-            loadUserActivity();
-            loadCategoryStats();
-            loadPopularProducts();
+            // 전체 통계 새로고침 버튼은 이제 모든 데이터를 동시에 비동기적으로 갱신
+            Promise.all([
+                loadStatistics(),
+                loadLightGCNStatus(),
+                loadUserActivity(),
+                loadCategoryStats(),
+                loadPopularProducts()
+            ]).then(() => {
+                console.log('모든 통계가 갱신되었습니다.');
+            }).catch(error => {
+                console.error('통계 갱신 중 오류 발생:', error);
+            });
         }
 
         // 데이터 내보내기
@@ -537,20 +580,49 @@
                     periodContent.innerHTML = `
                         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px;">
                             <div style="text-align: center; padding: 16px; background: #f7fafc; border-radius: 8px;">
-                                <div style="font-size: 1.8em; font-weight: 700; color: #4299e1;">${stats.period_users}</div>
+                                <div style="font-size: 1.8em; font-weight: 700; color: #4299e1;">${stats.period_users.toLocaleString()}</div>
                                 <div style="color: #718096;">기간 내 사용자</div>
                             </div>
                             <div style="text-align: center; padding: 16px; background: #f7fafc; border-radius: 8px;">
-                                <div style="font-size: 1.8em; font-weight: 700; color: #38a169;">${stats.period_views}</div>
+                                <div style="font-size: 1.8em; font-weight: 700; color: #38a169;">${stats.period_views.toLocaleString()}</div>
                                 <div style="color: #718096;">기간 내 조회수</div>
                             </div>
                             <div style="text-align: center; padding: 16px; background: #f7fafc; border-radius: 8px;">
-                                <div style="font-size: 1.8em; font-weight: 700; color: #ed8936;">${stats.period_searches}</div>
+                                <div style="font-size: 1.8em; font-weight: 700; color: #ed8936;">${stats.period_searches.toLocaleString()}</div>
                                 <div style="color: #718096;">기간 내 검색수</div>
                             </div>
                             <div style="text-align: center; padding: 16px; background: #f7fafc; border-radius: 8px;">
-                                <div style="font-size: 1.8em; font-weight: 700; color: #e53e3e;">${stats.daily_avg_views}</div>
+                                <div style="font-size: 1.8em; font-weight: 700; color: #e53e3e;">${stats.daily_avg_views.toLocaleString()}</div>
                                 <div style="color: #718096;">일평균 조회수</div>
+                            </div>
+                        </div>
+
+                        <!-- 시간대별 통계 -->
+                        <div style="margin-bottom: 24px;">
+                            <h4 style="margin-bottom: 16px; color: #2d3748;">시간대별 통계</h4>
+                            <div style="background: #f7fafc; border-radius: 8px; padding: 16px;">
+                                <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;">
+                                    ${stats.time_stats.map(period => `
+                                        <div style="text-align: center; padding: 12px; background: white; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                                            <div style="font-weight: 600; color: #2d3748;">${period.period}</div>
+                                            <div style="font-size: 0.9em; color: #4299e1;">조회 ${period.views.toLocaleString()}</div>
+                                            <div style="font-size: 0.9em; color: #38a169;">검색 ${period.searches.toLocaleString()}</div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- 요일별 통계 -->
+                        <div style="margin-bottom: 24px;">
+                            <h4 style="margin-bottom: 16px; color: #2d3748;">요일별 통계</h4>
+                            <div style="background: #f7fafc; border-radius: 8px; padding: 16px; display: flex; justify-content: space-around;">
+                                ${Object.entries(stats.daily_stats).map(([day, count]) => `
+                                    <div style="text-align: center;">
+                                        <div style="font-weight: 600; color: #2d3748;">${day}</div>
+                                        <div style="color: #4299e1;">${count.toLocaleString()}</div>
+                                    </div>
+                                `).join('')}
                             </div>
                         </div>
                         
@@ -560,8 +632,9 @@
                                 <div style="background: #f7fafc; border-radius: 8px; padding: 16px; max-height: 300px; overflow-y: auto;">
                                     ${stats.popular_products.map((product, index) => `
                                         <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e2e8f0;">
-                                            <span style="font-weight: 600;">${index + 1}. ${product.product_name}</span>
-                                            <span style="color: #718096;">${product.view_count}회</span>
+                                            <span style="font-weight: 600; flex: 2;">${index + 1}. ${product.product_name}</span>
+                                            <span style="color: #718096; flex: 1;">${product.category || '미분류'}</span>
+                                            <span style="color: #4299e1;">${product.view_count.toLocaleString()}회</span>
                                         </div>
                                     `).join('')}
                                 </div>
@@ -572,7 +645,7 @@
                                     ${stats.popular_categories.map((category, index) => `
                                         <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e2e8f0;">
                                             <span style="font-weight: 600;">${index + 1}. ${category.category}</span>
-                                            <span style="color: #718096;">${category.view_count}회</span>
+                                            <span style="color: #4299e1;">${category.view_count.toLocaleString()}회</span>
                                         </div>
                                     `).join('')}
                                 </div>
