@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from langdetect import detect
 from collections import defaultdict, Counter
 import math
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
 import time
 import pandas as pd
@@ -41,6 +43,12 @@ from langchain_community.chat_message_histories import (
 from langchain_core.chat_history import BaseChatMessageHistory
 import re, unicodedata, difflib
 from typing import Optional, Union, List, Dict, Any, Tuple, Iterable
+from langchain.docstore.document import Document
+
+#리랭킹 관련 임포트#
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+
 
 
 executor = ThreadPoolExecutor()
@@ -120,6 +128,12 @@ class ProductViewData(BaseModel):
 
 class SearchData(BaseModel):
     query: str
+
+#사용자 문장에서 부정적인 단어 처리를 위한 코드
+def strip_minus_terms(q: str) -> str:
+    # -뒤에 따옴표 구/일반 단어 제거, - 뒤에 띄어쓰기 있어도 처리
+    cleaned = re.sub(r'(?<!\S)-\s*(?:"[^"]+"|“[^”]+”|\'[^\']+\'|[^\s,;|]+)', '', q)
+    return re.sub(r'\s{2,}', ' ', cleaned).strip()
 
 #이벤트 관련 코드
 def _sign(msg: str) -> str:
@@ -219,8 +233,8 @@ async def login_post(username: str = Form(...), password: str = Form(...)):
     if not isinstance(ADMIN_USERNAME, str) or not isinstance(ADMIN_PASSWORD, str):
         return HTMLResponse("<h3>서버 설정 오류: 관리자 자격 미설정</h3>", status_code=500)
 
-
-    ok_user = _eq_ci(username, ADMIN_USERNAME)# 
+    # 아이디: 대소문자 무시를 원하면 _eq_ci, 정확히 일치 원하면 _eq_cs로 바꾸세요.
+    ok_user = _eq_ci(username, ADMIN_USERNAME)   # ← 필요시 _eq_cs로 교체
     # 비밀번호: 절대 변형하지 말고 상수시간 비교
     ok_pass = _eq_cs(password, ADMIN_PASSWORD)
 
@@ -332,7 +346,7 @@ class Ranker_DirectSearch:
         t = unicodedata.normalize('NFKC', txt)
         return ''.join(ch.lower() if 'A' <= ch <= 'Z' else ch for ch in t)
 
-    def _is_number(self, s: str) -> bool: 
+    def _is_number(self, s: str) -> bool:
         return bool(self._NUM.match(s))
 
     def _split_mixed(self, tok: str) -> List[str]:
@@ -367,52 +381,27 @@ class Ranker_DirectSearch:
     def _similarity(self, a: str, b: str) -> float:
         return difflib.SequenceMatcher(None, a, b).ratio()
 
-    # ######### [변경] 계단식 → 연속 가중치 매핑
     # def _best_weight(self, kw: str, item_tokens: List[str]) -> float:
-    #     if not item_tokens:
-    #         return self.W_MISS
-    #     if any(kw == t for t in item_tokens):
-    #         return self.W_EXACT
-
-    #     has_partial = False
+    #     if not item_tokens: return self.W_MISS
+    #     if any(kw == t for t in item_tokens): return self.W_EXACT
+    #     has_partial = any((kw in t) or (t in kw) for t in item_tokens)
     #     best_sim = 0.0
     #     for t in item_tokens:
-    #         if (kw in t) or (t in kw):
-    #             has_partial = True
     #         s = self._similarity(kw, t)
     #         if s > best_sim:
     #             best_sim = s
+    #             if best_sim >= self.near_threshold:
+    #                 return self.W_NEAR  # 근접이 부분보다 우선
+    #     if has_partial: return self.W_PART
+    #     return self.W_MISS
 
-    #     s = best_sim
-    #     s_low = 0.30  # 부분 매칭 하한
-    #     if s >= self.near_threshold:
-    #         # near(0.8)에서 시작해 s=1.0에선 약 0.95까지 부드럽게
-    #         return self.W_NEAR + 0.15 * (s - self.near_threshold) / (1.0 - self.near_threshold)
-    #     if s <= s_low:
-    #         return 0.10 if has_partial else self.W_MISS
-    #     # s_low ~ near_threshold 구간: 곡선 증가(감마=1.2)
-    #     a = ((s - s_low) / (self.near_threshold - s_low)) ** 1.2
-    #     base = 0.20 if has_partial else 0.10
-    #     return base + (self.W_PART - base) * a
-
-
+    ######### [변경] 계단식 → 연속 가중치 매핑
     def _best_weight(self, kw: str, item_tokens: List[str]) -> float:
-        """
-        키워드 매칭 가중치 계산 시 제외 키워드 처리
-        """
         if not item_tokens:
             return self.W_MISS
-
-        # 제외 키워드 처리
-        if kw.startswith('-'):
-            exclude_word = kw[1:]  # '-' 제거
-            # 제외할 단어가 포함되어 있으면 가중치 0
-            if any(exclude_word in t for t in item_tokens):
-                return 0.0
-            # 제외할 단어가 없으면 최대 가중치
+        if any(kw == t for t in item_tokens):
             return self.W_EXACT
 
-        # 기존 매칭 로직
         has_partial = False
         best_sim = 0.0
         for t in item_tokens:
@@ -422,23 +411,17 @@ class Ranker_DirectSearch:
             if s > best_sim:
                 best_sim = s
 
-        # 유사도에 따른 연속 가중치 매핑
-        if best_sim >= self.near_threshold:
-            return self.W_NEAR + 0.15 * (best_sim - self.near_threshold) / (1.0 - self.near_threshold)
-        if best_sim <= 0.30:
+        s = best_sim
+        s_low = 0.30  # 부분 매칭 하한
+        if s >= self.near_threshold:
+            # near(0.8)에서 시작해 s=1.0에선 약 0.95까지 부드럽게
+            return self.W_NEAR + 0.15 * (s - self.near_threshold) / (1.0 - self.near_threshold)
+        if s <= s_low:
             return 0.10 if has_partial else self.W_MISS
-        
-        # 중간 유사도 구간: 곡선 증가
-        a = ((best_sim - 0.30) / (self.near_threshold - 0.30)) ** 1.2
+        # s_low ~ near_threshold 구간: 곡선 증가(감마=1.2)
+        a = ((s - s_low) / (self.near_threshold - s_low)) ** 1.2
         base = 0.20 if has_partial else 0.10
         return base + (self.W_PART - base) * a
-
-
-
-
-
-
-
 
     # ---------- 내부: 아이템 텍스트 구성(스키마 자유) ----------
     def _build_item_text(
@@ -596,13 +579,24 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     lang_map = {
         "ko": "한국어",
         "en": "English",
-        "zh-cn": "中文",
+        "zh": "中文",
         "ja": "日本語",
         "vi": "Tiếng Việt",  # 베트남어
         "th": "ไทย",        # 태국어
+
+
+        "fr": "Français",
+        "de": "Deutsch",
+        "es": "Español",
+        "it": "Italiano",
+        "pt": "Português",
+        "ar": "العربية",
+        "fa": "فارسی",
+        "he": "עברית",
+        "sw": "Kiswahili",
     }
 
-    target_lang = lang_map.get(lang_code, "한국어")
+    target_lang = lang_map.get(lang_code, "English")
     print("[Debug] Detected language →", target_lang)
 
     # 시즌 판단
@@ -766,107 +760,43 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     # 대화 이력 가져오기
     history_messages = [msg.content for msg in session_history.messages]
-    conversation_context = "\n".join([f"이전 대화: {msg}" for msg in history_messages[-3:]]) if history_messages else "이전 대화 없음"
+    conversation_context = "\n".join([f"이전 대화: {msg}" for msg in history_messages[-10:]]) if history_messages else "이전 대화 없음"
 
-    # system_prompt = (
-    #     f"""System:
-    #         당신은 (1) 검색 엔진의 전처리를 담당하는 AI이자, (2) 쇼핑몰 검색 및 분류 전문가입니다.
-    #         입력 언어가 무엇이든 먼저 한국어로 의미 보존 번역을 수행합니다.
-            
-    #         [대화 컨텍스트]
-    #         {conversation_context}
-
-    #         [핵심 목표]
-    #         1. 사용자의 실제 검색 의도 파악
-    #         2. 검색에 중요한 모든 키워드 보존
-    #         3. 검색 정확도를 높이는 핵심 특성 유지
-
-    #         [전처리 목표]
-    #         - 오타 교정, 불용어 제거, 중복 표현 제거
-    #         - 단, 아래 ‘의도 표지’는 삭제 금지(표준화만 허용): “에게 좋은/에 좋은/맞는/추천/전용/선물용/타겟(남성·여성·아동 등)”
-    #         - “사용하기 좋은/쓰기 좋은/쓸만한/괜찮은”처럼 막연한 품질형용사만 제거
-    #         - 숫자+단위 결합(128 GB→128GB, 5000 mAh→5000mAh)
-
-    #         [특별 규칙: ‘용’ 접미사 정규화]
-    #         - “봄/여름/가을/겨울/간절기/사계절/남성/여성/공용/유아/아동/키즈/성인 + 용” → 접미사 ‘용’ 제거
-    #         예) 여름용 모자→여름 모자, 남성용 등산 바지→남성 등산 바지
-    #         - 단, 의미어는 보존: 전용/공용/용량/내용은 그대로 유지 (예: “닌텐도 전용 케이스”에서 ‘전용’ 삭제 금지)
-    #         - ‘용도’라는 일반어는 제거
-
-    #         [금지사항]
-    #         - 고객 검색어를 임의로 확장/추정하지 말 것(예: “스마트폰” → “스마트폰용 이어폰” 금지)
-    #         - 브랜드/모델/카테고리를 새로 만들지 말 것
-    #         - 불필요한 형용사·수식 남발 금지
-
-    #         [중요: 의미 보존]
-    #     - “<대상>에게 좋은/에 좋은/맞는/추천”은 의도 핵심이므로 반드시 유지(필요 시 ‘추천’으로 표준화 가능)
-    #     - 핵심 품목이 명확하지 않으면 원문 유지(축약·추정 금지)
-
-    #         [출력 규칙(반드시 정확히 준수)]
-    #         오직 두 줄만 출력, 따옴표 포함. 추가 설명/불릿/번호/코드블록 절대 금지.
-    #         Raw Query: "<query>"
-    #         Preprocessed Query: "<전처리된_쿼리(핵심 품목 + 유의미 속성만, ‘용’ 제거 후 표준형)>"
-    #     """    
-    # )
     system_prompt = (
         f"""System:
-            당신은 쇼핑몰 검색 엔진의 전처리를 담당하는 AI입니다.
-            사용자의 자연어 쿼리를 실제 검색에 유용한 핵심 키워드로 변환하는 것이 주 임무입니다.
-
+            당신은 (1) 검색 엔진의 전처리를 담당하는 AI이자, (2) 쇼핑몰 검색 및 분류 전문가입니다.
+            입력 언어가 무엇이든 먼저 한국어로 의미 보존 번역을 수행합니다.
             
             [대화 컨텍스트]
-            {conversation_context}
-
-            [핵심 규칙]
-
-            1. 부정 표현의 문맥 이해
-            - "A 빼고" → "A"를 제외한 다른 키워드로 변환
-            - "A 말고" → "A"의 대체/대안 키워드로 변환
-            - "A 아닌" → "A"의 반대 개념이나 대체 키워드로 변환
-
-            예시:
-            - "몽쉘 빼고 과자" → "과자 -몽쉘"
-            - "검은색 말고 흰색 티셔츠" → "흰색 티셔츠"
-            - "면 소재 아닌 옷" → "폴리에스터 린넨 실크 울"
+            {conversation_context}를 잘보고 사용자가 무엇을 찾고자하는지 파악한 다음 그 키워드를 구성해서 다음작업을 진행하세요.!!
 
 
-            2. 문맥 파악
-            - "비올 때 사용할 수 있는 거" → "우산" "우비" "레인부츠" 등 실제 제품 키워드 추출
-            - "더울 때 입을만한 옷" → "반팔" "반바지" "린넨" "썸머" 등 구체적 품목 추출
-            - "아이가 가지고 놀만한 것" → "장난감" "교구" "블록" 등 구체적 품목 추출
+            [전처리 원칙]
+            1) 사용자가 모호한 상위개념으로 묻는 경우(예: "한국식 과자", "여름 원피스", "세차용품") → 
+            카테고리/유형/대표 상품명으로 확장된 표면어 다발을 만든다.
+            *사용자의 문장을 이해해서 추측도 반드시 해본다! 질문에 대해서 답을 생성도 같이해서 제일 앞에 단어를 붙인다.*
 
-            3. 검색 의도 보존
-            - 간접적/우회적 표현 → 직접적인 상품 키워드로 변환
-            - 상황/용도 설명 → 구체적인 제품군으로 매핑
-            - 모호한 표현 → 가장 관련성 높은 핵심 품목으로 구체화
+            - 확장은 3~7개 사이의 "핵심 하위유형/동의어"로 한정(오버확장 금지).
+            - 브랜드/스펙/색/규격/수량/가격 등 명시 제약이 있으면 보존.
+            - "추천/최고/인기" 같은 수식어는 제거하고, 실제 검색에 유의미한 토큰만 남긴다.
+            2) 한국 쇼핑 맥락의 일반명은 단수 표면형을 우선(복수/어미/조사 제거).
+            3) '용' 같은 불용미사/꼬리표는 제거.
+            4) 불필요한 구두점은 제거. OR, |, 콤마 대신 **공백 나열**만 사용.
+            5) **부정/제외 처리(아주 중요)**:
+            - 다음 패턴을 부정 신호로 인식한다: "싫어/싫다/말고/빼고/제외(하고/한)/아닌/제외해줘/빼줘/미포함/제외 부탁" 등.
+            - "A 말고 B", "A는 싫고 B", "B 찾는데 A 제외" 형태에서는 **A는 제외(-A), B는 유지**한다.
+            - 제외 토큰은 단어·구를 **표준형으로 정규화**하고 **하이픈(-토큰)** 으로 표기한다(예: -호박맛, -딸기, -화이트).
+            - 다단 제외가 있으면 공백으로 나열한다: 예) "사과 주스 -호박맛 -배맛".
+            - 핵심 품목이 불명확하고 제외만 존재할 경우, **추정하지 말고 원문 유지**(의미 보존 원칙).
 
-            4. 핵심어 추출 원칙
-            - 불필요한 조사/어미 제거
-            - 관련성 높은 2-3개의 핵심 키워드만 선택
-            - 검색에 도움되는 구체적인 속성은 유지(예: 사이즈, 색상, 재질 등)
+            [중요: 의미 보존]
+        - “<대상>에게 좋은/에 좋은/맞는/추천”은 의도 핵심이므로 반드시 유지(필요 시 ‘추천’으로 표준화 가능)
+        - 핵심 품목이 명확하지 않으면 원문 유지(축약·추정 금지)
 
-            [예시]
-            입력: "비올 때 사용할 수 있는 거"
-            출력:
-            Raw Query: "비올 때 사용할 수 있는 거"
-            Preprocessed Query: "우산 우비 레인부츠"
-
-            입력: "더울 때 입을만한 옷"
-            출력:
-            Raw Query: "더울 때 입을만한 옷"
-            Preprocessed Query: "여름옷 반팔 반바지"
-
-            입력: "아이가 가지고 놀만한 것"
-            출력:
-            Raw Query: "아이가 가지고 놀만한 것"
-            Preprocessed Query: "장난감 교구 블록"
-
-
-            [출력 규칙]
-            두 줄만 출력:
-            Raw Query: "<원본 쿼리>"
-            Preprocessed Query: "<추출된 핵심 키워드들>"
-
+            [출력 규칙(반드시 정확히 준수)]
+            오직 두 줄만 출력, 따옴표 포함. 추가 설명/불릿/번호/코드블록 절대 금지.
+            Raw Query: "<query>"
+            Preprocessed Query: "<전처리된_쿼리(핵심 품목 + 유의미 속성만, ‘용’ 제거 후 표준형)>"
         """    
     )
 
@@ -884,6 +814,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     )
     llm_response = resp.choices[0].message.content.strip()
     print("[Debug] LLM full response:\n", llm_response)  # ← 여기에!
+
+
+
+
+
+
+    # print("session_history.messages:",session_history.messages)
+    # print("session_history:",session_history)
+
     def extract_preprocessed(llm_text: str, fallback: str) -> str:
         # 0) 혹시 JSON으로 온 경우 대비
         try:
@@ -920,8 +859,12 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
         # 4) 최종 폴백: 원문
         return fallback
+    
+    terms = extract_preprocessed(llm_response, query)
+    
+    preprocessed_query = strip_minus_terms(terms)
 
-    preprocessed_query = extract_preprocessed(llm_response, query)
+    print("[Debug] Preprocessed Query_Before ->", terms)
     print("[Debug] Preprocessed Query ->", preprocessed_query)
 
 
@@ -956,8 +899,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         for i,(name,dist) in enumerate(top5,1):
             print(f"  {i}. {name} | L2={dist:.6f}")
         return top5
-
-
 
     # # 상위 카테고리에 대해 각각 상품 검색 (시즌 보정 적용)
     def get_adjusted_score(category_name: str, score: float, season: str) -> float:
@@ -1020,44 +961,336 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             "카테고리":    e.get("category_name", "카테고리 없음"),
             "검색방식":    "벡터검색",
         }
+   
 
-    def season_filter_items(items: list, season_hint: str):
-        """시즌에 맞지 않는 후보 제거(강 키워드 기준) — 기존 시즌 키워드 그대로 활용"""
-        if season_hint not in ("봄","여름","가을","겨울"):
-            return items
+    # #################################################################
+    # #                          방법 1 시작                                #
+    # #################################################################
 
-        if season_hint == "여름":
-            neg = list(WINTER_KEYWORDS) + ["방울","털","비니","니트","퍼","기모","방한"]
-        elif season_hint == "겨울":
-            neg = list(SUMMER_KEYWORDS) + ["라피아","스트로","스트로우","썬캡","쿨링","냉감","메쉬"]
-        elif season_hint in ("봄","가을"):
-            neg = list(SUMMER_KEYWORDS) + list(WINTER_KEYWORDS)
-        else:
-            neg = tuple()
 
-        kept, removed = [], 0
-        for it in items:
-            name = f"{it.get('제목','')} {it.get('카테고리','')}"
-            if _has_any(name, neg):
-                removed += 1
-                continue
-            kept.append(it)
-        print(f"[Top2-Stage] 시즌('{season_hint}') 필터: 제거 {removed}, 유지 {len(kept)}")
-        return kept
+    # # 1) 전 카테고리 1000개 벡터 검색 후 점수 부여
+    # print("\n[방법1] 1000개 벡터 검색 시작")
+    # vector_hits_1000 = collection.search(
+    #     data=[q_vec],
+    #     anns_field="emb",
+    #     param={"metric_type":"L2","params":{"nprobe":64}},
+    #     limit=1000,  # 1000개 검색
+    #     output_fields=[
+    #         "product_code","category_code","category_name","market_product_name",
+    #         "market_price","shipping_fee","shipping_type","max_quantity",
+    #         "composite_options","image_url","manufacturer","model_name",
+    #         "origin","keywords","description","return_shipping_fee",
+    #     ]
+    # )
     
 
-    #################################################################
-    #                          방법 1 시작                                #
-    #################################################################
+    # print("\n[방법1] 벡터 검색 결과 1000개에서 직접 검색 및 점수 결합 시작")
+    
+
+    # # 1. 벡터 검색 결과에 점수 부여 (1000점 → 1점)
+    # vector_items = []
+    # for hits in vector_hits_1000:
+    #     for idx, hit in enumerate(hits):
+    #         item = _build_info_from_hit(hit)
+    #         item['vector_match_score'] = 1000 - idx  # 1등: 1000점, 1000등: 1점
+    #         vector_items.append(item)
+    # print(f"[방법1] 벡터 검색 1000개 완료: {len(vector_items)}개")
 
 
-    # 1) 전 카테고리 1000개 벡터 검색 후 점수 부여
-    print("\n[방법1] 1000개 벡터 검색 시작")
+    # # 편의 함수  (직접검색 점수 계산인데 아직 안씀..?)
+    # def DirectSearch(user_text: str, items: List[Union[str, Dict[str, Any]]],
+    #         fields: Optional[Iterable[str]] = None,
+    #         near_threshold: float = 0.90,
+    #         return_query_meta: bool = False) -> List[Dict[str, Any]]:
+    #     ds = Ranker_DirectSearch(near_threshold=near_threshold)
+    #     return ds.score_items(user_text, items, fields=fields, return_query_meta=return_query_meta)
+
+    # tokens = [t for t in re.sub(r"[용\s]+", " ", preprocessed_query).split() if t]
+
+    # ds = Ranker_DirectSearch()
+    # qmeta = ds.prepare_query(preprocessed_query)
+    # print("원문:", qmeta["original"])
+    # print("정규화:", qmeta["normalized"])
+    # print("토큰:", qmeta["tokens"])
+    # print("정제쿼리(canonical):", qmeta["canonical_query"])
+
+    # direct_items = []
+
+    # # 1) 직접검색 매칭 점수(0~1000) 계산: 대상 = 벡터검색 결과 리스트 전체(vector_items)
+    # for item in vector_items:
+    #     title = item.get('제목', '')               # '제목'이 항상 있으면 item['제목'] 사용해도 됨
+    #     item['direct_match_score'] = ds.score_text(preprocessed_query, title) # 0~1000점 연속값
+
+    # # 2) 벡터검색 순위 점수 부여 (1000 → 1점)
+    # for idx, item in enumerate(vector_items):
+    #     item['vector_rank_score'] = 1000 - idx  # 1등: 1000점, 2등: 999점, ...
+
+    # # 3) 직접검색 순위 점수 부여 (1000 → 1점)
+    # direct_sorted = sorted(vector_items, key=lambda x: x['direct_match_score'], reverse=True)
+    # for idx, item in enumerate(direct_sorted):
+    #     item['direct_rank_score'] = 1000 - idx  # 1등: 1000점, 2등: 999점, ...
+
+    # # 4) 최종 점수 계산
+    # for item in vector_items:
+    #     # 벡터중심 변환점수 (벡터 0.7 + 직접 0.3)
+    #     item['vector_final_score'] = (0.7 * item['vector_rank_score'] + 0.3 * item['direct_rank_score'])
+    #     # 직접중심 변환점수 (벡터 0.3 + 직접 0.7)
+    #     item['direct_final_score'] = (0.3 * item['vector_rank_score'] + 0.7 * item['direct_rank_score'])
+        
+    # print("\n[방법1] 점수 정규화 및 최종 점수 계산 완료")
+    # print("상위 5개 항목 점수 분포:")
+    # sorted_items = sorted(vector_items, key=lambda x: x['direct_final_score'], reverse=True)[:5]
+    # for idx, item in enumerate(sorted_items, 1):
+    #     print(f"\n{idx}. {item['제목']}")
+    #     print(f"   직접오리지널점수: {item['direct_match_score']:.1f}, 벡터매칭: {item['vector_match_score']:.1f}")
+    #     print(f"   직접검색 1000점을 변환점수: {item['direct_rank_score']:.1f}")
+    #     print(f"   벡터검색 1000점을 변환점수: {item['vector_rank_score']:.1f}")
+    #     print(f"   최종점수: {item['direct_final_score']:.1f} (직접중심) / {item['vector_final_score']:.1f} (벡터중심)")
+
+
+    # ranked = DirectSearch(preprocessed_query, vector_items, fields=("제목",))
+    # print(f"{'Rank':>4}  {'Score':>5}  제목")
+    # print("-"*48)
+    # for i, r in enumerate(ranked[:30], 1):
+    #     item = r["item"]
+    #     title = item["제목"] if isinstance(item, dict) else str(item)
+    #     print(f"{i:>4}  {r['direct_text_score']:>5}  {title}")
+
+
+    # # direct_match_score 기준 내림차순 정렬 → 직접검색 "랭크 점수"(1000→1) 대입
+    # direct_items = sorted(vector_items, key=lambda x: x['direct_match_score'], reverse=True)
+    # for r_idx, it in enumerate(direct_items):
+    #     it['direct_score'] = max(1, 1000 - r_idx)  # 1등 1000, 1000등 1
+
+    # # direct_score가 없는 항목(이론상 없지만 안전용) 0으로 보정
+    # for it in vector_items:
+    #     if 'direct_score' not in it:
+    #         it['direct_score'] = 0
+
+    # print(f"[방법1] 직접 검색 매칭: {len(direct_items)}개")
+
+    # # 3) 점수 통합 (벡터/직접오리지널점수 점수 결합)
+    # for item in vector_items:
+    #     # 벡터기반 선발
+    #     item['vector_focused_score'] = 0.7*item['vector_match_score'] + 0.3*item['direct_score']  
+    #     # 직접기반 선발
+    #     item['direct_focused_score'] = 0.3*item['vector_match_score'] + 0.7*item['direct_score']
+    # print("\n[방법1] 점수 계산 완료")
+
+    # # === 최종 10개 선정 (직접 7 + 벡터 3) — 상품코드 중복 제거 ===
+    # raw_candidates = []
+    # seen_codes = set()
+
+
+
+
+
+
+
+    # # 1. 벡터 검색 결과 1000개에 대한 순위 점수 부여 (1000점 → 1점)
+    # for idx, item in enumerate(vector_items):
+    #     item['vector_rank_score'] = max(1, 1000 - idx)  # 1등: 1000점, 1000등: 1점
+
+    # # 2. 직접 검색 결과에 대한 순위 점수 부여 (1000점 → 1점)
+    # direct_sorted = sorted(vector_items, key=lambda x: x['direct_match_score'], reverse=True)
+    # for idx, item in enumerate(direct_sorted):
+    #     item['direct_rank_score'] = max(1, 1000 - idx)  # 1등: 1000점, 마지막등: 1점
+    
+    # # 3. 최종 점수 계산
+    # for item in vector_items:
+    #     # 벡터 중심 점수 (벡터 0.7 + 직접 0.3)
+    #     item['vector_final_score'] = (
+    #         0.7 * item['vector_rank_score'] +
+    #         0.3 * item['direct_rank_score']
+    #     )
+    #     # 직접 중심 점수 (벡터 0.3 + 직접 0.7)
+    #     item['direct_final_score'] = (
+    #         0.3 * item['vector_rank_score'] +
+    #         0.7 * item['direct_rank_score']
+    #     )
+    
+    # # 직접검색 점수가 같은 경우 벡터 점수로 2차 정렬하는 key 함수
+    # def direct_sort_key(item):
+    #     return (
+    #         item['direct_final_score'],  # 1차 정렬: 직접검색 점수
+    #         item['vector_final_score']   # 2차 정렬: 벡터 점수
+    #     )
+    
+    # direct_sorted = sorted(vector_items, key=direct_sort_key, reverse=True)
+
+    # print("\n[방법1] 직접검색 중심 상위 10개 점수 분포:")
+    # for idx, item in enumerate(direct_sorted[:10], 1):
+    #     print(f"{idx}. {item['제목']}")
+    #     print(f"   벡터순위점수: {item['vector_rank_score']:.1f}")
+    #     print(f"   직접순위점수: {item['direct_rank_score']:.1f}")
+    #     print(f"   직접오리지날점수: {item['direct_match_score']:.1f}")
+    #     print(f"   최종점수(직접중심): {item['direct_final_score']:.1f}")
+
+    # # 직접검색 상위 3개 선정 (점수가 0인 항목 제외)
+    # for item in direct_sorted:
+    #     if len(raw_candidates) >= 3:
+    #         break
+    #     code = item.get('상품코드')
+    #     if code and code not in seen_codes:
+    #         # 직접 검색 점수가 0점이면 건너뛰기
+    #         if item['direct_rank_score'] == 0:
+    #             continue
+                
+    #         seen_codes.add(code)
+    #         raw_candidates.append(item)
+    #         print(f"\n[방법1] 직접검색 선정 {len(raw_candidates)}/3:")
+    #         print(f"제목: {item['제목']}")
+    #         print(f"점수: 벡터={item['vector_rank_score']:.1f}, "
+    #               f"직접={item['direct_rank_score']:.1f}, "
+    #               f"최종(직접)={item['direct_final_score']:.1f}, "
+    #               f"최종(벡터)={item['vector_final_score']:.1f}")
+
+    # # 5. 벡터 검색 중심으로 7개 선정 (중복 제외)
+    # vector_sorted = sorted(vector_items, key=lambda x: x['vector_final_score'], reverse=True)
+
+    # print("\n[방법1] 벡터검색 중심 상위 10개 점수 분포:")
+    # for idx, item in enumerate(vector_sorted[:10], 1):
+    #     print(f"{idx}. {item['제목']}")
+    #     print(f"   벡터순위점수: {item['vector_rank_score']:.1f}")
+    #     print(f"   직접오리지날점수: {item['direct_match_score']:.1f}")
+    #     print(f"   직접순위점수: {item['direct_rank_score']:.1f}")
+    #     print(f"   최종점수(벡터중심): {item['vector_final_score']:.1f}")
+
+    # # 벡터검색에서 7개 선정 (직접검색과 중복 시 다음 순위로 대체)
+    # vector_selections = []
+    # current_index = 0
+    
+    # # 벡터검색 결과에서 7개를 채울 때까지 반복
+    # while len(vector_selections) < 7 and current_index < len(vector_sorted):
+    #     item = vector_sorted[current_index]
+    #     code = item.get('상품코드')
+        
+    #     # 이미 직접검색에서 선정된 상품이면 다음 순위로
+    #     if code in seen_codes:
+    #         current_index += 1
+    #         continue
+            
+    #     seen_codes.add(code)
+    #     vector_selections.append(item)
+    #     raw_candidates.append(item)
+    #     print(f"\n[방법1] 벡터검색 선정 {len(vector_selections)}/7:")
+    #     print(f"제목: {item['제목']}")
+    #     print(f"점수: 벡터={item['vector_rank_score']:.1f}, "
+    #           f"직접={item['direct_rank_score']:.1f}, "
+    #           f"최종={item['vector_final_score']:.1f}")
+        
+    #     current_index += 1
+
+    # # 모든 상품을 하나의 리스트로 순차적으로 수집
+    # final_results = []
+    # seen_codes = set()
+    
+    # # 1. 먼저 직접검색 상위 결과들을 3개씩 수집
+    # direct_count = 0
+    # for item in direct_sorted:
+    #     if direct_count >= 15:  # 5세트 × 3개 = 15개
+    #         break
+    #     code = item.get('상품코드')
+    #     if code and code not in seen_codes:
+    #         if item['direct_rank_score'] == 0:  # 직접 검색 점수가 0점이면 건너뛰기
+    #             continue
+    #         seen_codes.add(code)
+    #         final_results.append(item)
+    #         direct_count += 1
+            
+    # # 2. 그 다음 벡터검색 결과들을 7개씩 수집
+    # vector_count = 0
+    # for item in vector_sorted:
+    #     if vector_count >= 35:  # 5세트 × 7개 = 35개
+    #         break
+    #     code = item.get('상품코드')
+    #     if code and code not in seen_codes:
+    #         seen_codes.add(code)
+    #         final_results.append(item)
+    #         vector_count += 1
+    
+    # # 3. 10개씩 세트로 분할
+    # all_sets = []
+    # for i in range(0, len(final_results), 10):
+    #     current_set = final_results[i:i+10]
+    #     if len(current_set) == 10:  # 완전한 세트만 추가
+    #         all_sets.append(current_set)
+    
+    # # 모든 세트 출력
+    # print(f"\n[방법1] 전체 {len(all_sets)}개 세트 구성 완료")
+    # for set_num, set_items in enumerate(all_sets, 1):
+    #     print(f"\n=== 세트 {set_num} (총 {len(set_items)}개 상품) ===")
+    #     for idx, item in enumerate(set_items, 1):
+    #         print(f"\n{idx}. {item['제목']}")
+    #         print(f"   카테고리: {item['카테고리']}")
+    #         print(f"   가격: {item['가격']:,}원")
+    #         print(f"   점수: 벡터={item['vector_rank_score']:.1f}, "
+    #               f"직접={item['direct_rank_score']:.1f}, "
+    #               f"최종={item['vector_final_score']:.1f}")
+    
+    # print(f"\n[방법1] 총 상품 수: {sum(len(s) for s in all_sets)}개")
+    # print("\n[방법1] 최종 선정 10개 리스트:", *[(item['상품코드'], item['제목'], item['가격']) for item in all_sets[0]], sep="\n")
+    # print("\n[방법1] 2번째 최종 선정 10개 리스트:", *[(item['상품코드'], item['제목'], item['가격']) for item in all_sets[1]], sep="\n")
+    # print("\n[방법1] 3번째 최종 선정 10개 리스트:", *[(item['상품코드'], item['제목'], item['가격']) for item in all_sets[2]], sep="\n")
+
+
+
+
+
+
+    # #################################################################
+    # #                          방법 1 끝                             #
+    # #################################################################
+
+
+
+
+
+
+
+    # #################################################################
+    # #                         NEW 방법 1 시작                                #
+    # #################################################################
+    ####메타 데이터의  카테고리와 임베딩 된 카테고리를 서로 매칭 시키기 위한 로직.
+    cat_col = Collection("ownerclan_category")  # 스키마: id, category_full, embedding ...
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", "", (s or "").strip().lower())
+
+    # 질의 벡터(q_vec)로 카테고리 ANN 검색
+    cat_hits = cat_col.search(
+        data=[q_vec],
+        anns_field="embedding",
+        param={"metric_type":"L2","params":{"nprobe":32}},
+        limit=200,
+        output_fields=["id","category_full"]
+    )
+
+
+
+    # 카테고리명 기준의 랭크 테이블 (1등=1)
+    cat_rank_by_name = {}
+    rank_counter = 1
+    for hits in cat_hits:
+        for h in hits:
+            cat_name = (h.get("category_full") 
+                        or getattr(h, "category_full", None) 
+                        or (hasattr(h, "fields") and h.fields.get("category_full")))
+            if not cat_name: 
+                continue
+            key = _norm(cat_name)
+            if key not in cat_rank_by_name:
+                cat_rank_by_name[key] = rank_counter
+                rank_counter += 1
+
+
+    # 1) 전 카테고리 1000개 벡터 검색
+    print("\n[방법1/RRF] 1000개 벡터 검색 시작")
     vector_hits_1000 = collection.search(
         data=[q_vec],
         anns_field="emb",
         param={"metric_type":"L2","params":{"nprobe":64}},
-        limit=1000,  # 1000개 검색
+        limit=1000,
         output_fields=[
             "product_code","category_code","category_name","market_product_name",
             "market_price","shipping_fee","shipping_type","max_quantity",
@@ -1065,265 +1298,143 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             "origin","keywords","description","return_shipping_fee",
         ]
     )
-    
 
-    print("\n[방법1] 벡터 검색 결과 1000개에서 직접 검색 및 점수 결합 시작")
-    
-
-    # 1. 벡터 검색 결과에 점수 부여 (1000점 → 1점)
+    # 검색 결과 -> dict 리스트
     vector_items = []
     for hits in vector_hits_1000:
         for idx, hit in enumerate(hits):
-            item = _build_info_from_hit(hit)
-            item['vector_match_score'] = 1000 - idx  # 1등: 1000점, 1000등: 1점
+            item = _build_info_from_hit(hit)            # ✨ 제목/카테고리만 담긴 info (본문 X)
+            item["vector_match_score"] = 1000 - idx     # 벡터 1등=1000, 1000등=1 (순위 신호로만 사용)
             vector_items.append(item)
-    print(f"[방법1] 벡터 검색 1000개 완료: {len(vector_items)}개")
 
+    print(f"[방법1/RRF] 벡터 검색 1000개 완료: {len(vector_items)}개")
 
-    # 편의 함수  (직접검색 점수 계산인데 아직 안씀..?)
-    def DirectSearch(user_text: str, items: List[Union[str, Dict[str, Any]]],
-            fields: Optional[Iterable[str]] = None,
-            near_threshold: float = 0.90,
-            return_query_meta: bool = False) -> List[Dict[str, Any]]:
-        ds = Ranker_DirectSearch(near_threshold=near_threshold)
-        return ds.score_items(user_text, items, fields=fields, return_query_meta=return_query_meta)
-
-    tokens = [t for t in re.sub(r"[용\s]+", " ", preprocessed_query).split() if t]
-
+    # ---------- 직접매칭(문자열) 점수: '제목'과 '카테고리'만 ----------
     ds = Ranker_DirectSearch()
-    qmeta = ds.prepare_query(preprocessed_query)
-    print("원문:", qmeta["original"])
-    print("정규화:", qmeta["normalized"])
-    print("토큰:", qmeta["tokens"])
-    print("정제쿼리(canonical):", qmeta["canonical_query"])
-
-    direct_items = []
-
-    # 1) 직접검색 매칭 점수(0~1000) 계산: 대상 = 벡터검색 결과 리스트 전체(vector_items)
-    for item in vector_items:
-        title = item.get('제목', '')               # '제목'이 항상 있으면 item['제목'] 사용해도 됨
-        item['direct_match_score'] = ds.score_text(preprocessed_query, title) # 0~1000점 연속값
-
-    # 2) 벡터검색 순위 점수 부여 (1000 → 1점)
-    for idx, item in enumerate(vector_items):
-        item['vector_rank_score'] = 1000 - idx  # 1등: 1000점, 2등: 999점, ...
-
-    # 3) 직접검색 순위 점수 부여 (1000 → 1점)
-    direct_sorted = sorted(vector_items, key=lambda x: x['direct_match_score'], reverse=True)
-    for idx, item in enumerate(direct_sorted):
-        item['direct_rank_score'] = 1000 - idx  # 1등: 1000점, 2등: 999점, ...
-
-    # 4) 최종 점수 계산
-    for item in vector_items:
-        # 벡터중심 변환점수 (벡터 0.7 + 직접 0.3)
-        item['vector_final_score'] = (0.7 * item['vector_rank_score'] + 0.3 * item['direct_rank_score'])
-        # 직접중심 변환점수 (벡터 0.3 + 직접 0.7)
-        item['direct_final_score'] = (0.3 * item['vector_rank_score'] + 0.7 * item['direct_rank_score'])
-        
-    print("\n[방법1] 점수 정규화 및 최종 점수 계산 완료")
-    print("상위 5개 항목 점수 분포:")
-    sorted_items = sorted(vector_items, key=lambda x: x['direct_final_score'], reverse=True)[:5]
-    for idx, item in enumerate(sorted_items, 1):
-        print(f"\n{idx}. {item['제목']}")
-        print(f"   직접오리지널점수: {item['direct_match_score']:.1f}, 벡터매칭: {item['vector_match_score']:.1f}")
-        print(f"   직접검색 1000점을 변환점수: {item['direct_rank_score']:.1f}")
-        print(f"   벡터검색 1000점을 변환점수: {item['vector_rank_score']:.1f}")
-        print(f"   최종점수: {item['direct_final_score']:.1f} (직접중심) / {item['vector_final_score']:.1f} (벡터중심)")
-
-
-    ranked = DirectSearch(preprocessed_query, vector_items, fields=("제목",))
-    print(f"{'Rank':>4}  {'Score':>5}  제목")
-    print("-"*48)
-    for i, r in enumerate(ranked[:30], 1):
-        item = r["item"]
-        title = item["제목"] if isinstance(item, dict) else str(item)
-        print(f"{i:>4}  {r['direct_text_score']:>5}  {title}")
-
-
-    # direct_match_score 기준 내림차순 정렬 → 직접검색 "랭크 점수"(1000→1) 대입
-    direct_items = sorted(vector_items, key=lambda x: x['direct_match_score'], reverse=True)
-    for r_idx, it in enumerate(direct_items):
-        it['direct_score'] = max(1, 1000 - r_idx)  # 1등 1000, 1000등 1
-
-    # direct_score가 없는 항목(이론상 없지만 안전용) 0으로 보정
     for it in vector_items:
-        if 'direct_score' not in it:
-            it['direct_score'] = 0
+        it["direct_title_score"] = ds.score_text(preprocessed_query, it.get("제목", ""))
+        it["direct_cate_score"]  = ds.score_text(preprocessed_query, it.get("카테고리", ""))
 
-    print(f"[방법1] 직접 검색 매칭: {len(direct_items)}개")
+        # 카테고리 임베딩 순위(이름 기반 조회)
+        cat_key = _norm(it.get("카테고리",""))
+        it["cat_emb_rank"] = cat_rank_by_name.get(cat_key)  # 없으면 None
 
-    # 3) 점수 통합 (벡터/직접오리지널점수 점수 결합)
-    for item in vector_items:
-        # 벡터기반 선발
-        item['vector_focused_score'] = 0.7*item['vector_match_score'] + 0.3*item['direct_score']  
-        # 직접기반 선발
-        item['direct_focused_score'] = 0.3*item['vector_match_score'] + 0.7*item['direct_score']
-    print("\n[방법1] 점수 계산 완료")
-
-    # === 최종 10개 선정 (직접 7 + 벡터 3) — 상품코드 중복 제거 ===
-    raw_candidates = []
-    seen_codes = set()
-
-
-
-
-
-
-
-    # 1. 벡터 검색 결과 1000개에 대한 순위 점수 부여 (1000점 → 1점)
-    for idx, item in enumerate(vector_items):
-        item['vector_rank_score'] = max(1, 1000 - idx)  # 1등: 1000점, 1000등: 1점
-
-    # 2. 직접 검색 결과에 대한 순위 점수 부여 (1000점 → 1점)
-    direct_sorted = sorted(vector_items, key=lambda x: x['direct_match_score'], reverse=True)
-    for idx, item in enumerate(direct_sorted):
-        item['direct_rank_score'] = max(1, 1000 - idx)  # 1등: 1000점, 마지막등: 1점
     
-    # 3. 최종 점수 계산
-    for item in vector_items:
-        # 벡터 중심 점수 (벡터 0.7 + 직접 0.3)
-        item['vector_final_score'] = (
-            0.7 * item['vector_rank_score'] +
-            0.3 * item['direct_rank_score']
-        )
-        # 직접 중심 점수 (벡터 0.3 + 직접 0.7)
-        item['direct_final_score'] = (
-            0.3 * item['vector_rank_score'] +
-            0.7 * item['direct_rank_score']
-        )
-    
-    # 직접검색 점수가 같은 경우 벡터 점수로 2차 정렬하는 key 함수
-    def direct_sort_key(item):
-        return (
-            item['direct_final_score'],  # 1차 정렬: 직접검색 점수
-            item['vector_final_score']   # 2차 정렬: 벡터 점수
-        )
-    
-    direct_sorted = sorted(vector_items, key=direct_sort_key, reverse=True)
 
-    print("\n[방법1] 직접검색 중심 상위 10개 점수 분포:")
-    for idx, item in enumerate(direct_sorted[:10], 1):
-        print(f"{idx}. {item['제목']}")
-        print(f"   벡터순위점수: {item['vector_rank_score']:.1f}")
-        print(f"   직접순위점수: {item['direct_rank_score']:.1f}")
-        print(f"   직접오리지날점수: {item['direct_match_score']:.1f}")
-        print(f"   최종점수(직접중심): {item['direct_final_score']:.1f}")
-
-    # 직접검색 상위 3개 선정 (점수가 0인 항목 제외)
-    for item in direct_sorted:
-        if len(raw_candidates) >= 3:
-            break
-        code = item.get('상품코드')
-        if code and code not in seen_codes:
-            # 직접 검색 점수가 0점이면 건너뛰기
-            if item['direct_rank_score'] == 0:
+    # ---------- 순위를 만들어야 RRF를 적용할 수 있음 ----------
+    def make_rank(items, score_key):
+        # 점수>0 인 것만 순위화 (1등=1)
+        ranked = sorted(items, key=lambda x: x.get(score_key, 0) or 0, reverse=True)
+        rank = {}
+        r = 1
+        for it in ranked:
+            sc = it.get(score_key, 0) or 0
+            if sc <= 0:
                 continue
-                
-            seen_codes.add(code)
-            raw_candidates.append(item)
-            print(f"\n[방법1] 직접검색 선정 {len(raw_candidates)}/3:")
-            print(f"제목: {item['제목']}")
-            print(f"점수: 벡터={item['vector_rank_score']:.1f}, "
-                  f"직접={item['direct_rank_score']:.1f}, "
-                  f"최종(직접)={item['direct_final_score']:.1f}, "
-                  f"최종(벡터)={item['vector_final_score']:.1f}")
+            code = it.get("상품코드")
+            if code and code not in rank:
+                rank[code] = r
+                r += 1
+        return rank
 
-    # 5. 벡터 검색 중심으로 7개 선정 (중복 제외)
-    vector_sorted = sorted(vector_items, key=lambda x: x['vector_final_score'], reverse=True)
+    # 벡터도 "순위"만 사용 (값 자체 가중치는 안 씀)
+    vector_rank = {
+        it.get("상품코드"): i + 1
+        for i, it in enumerate(sorted(vector_items, key=lambda x: x.get("vector_match_score", 0), reverse=True))
+    }
+    title_rank = make_rank(vector_items, "direct_title_score")
+    cate_rank  = make_rank(vector_items, "direct_cate_score")
 
-    print("\n[방법1] 벡터검색 중심 상위 10개 점수 분포:")
-    for idx, item in enumerate(vector_sorted[:10], 1):
-        print(f"{idx}. {item['제목']}")
-        print(f"   벡터순위점수: {item['vector_rank_score']:.1f}")
-        print(f"   직접오리지날점수: {item['direct_match_score']:.1f}")
-        print(f"   직접순위점수: {item['direct_rank_score']:.1f}")
-        print(f"   최종점수(벡터중심): {item['vector_final_score']:.1f}")
+    # 1) RRF 점수 계산 전 결과 출력 (벡터 매칭 점수 및 직접 점수 출력)
+    print("\n[방법1/RRF] RRF 점수 계산 전 결과:")
+    for idx, item in enumerate(vector_items[:10], 1):  # 상위 10개 출력
+        print(f"{idx}. {item['제목']} | {item['카테고리']} | 벡터 점수: {item.get('vector_match_score', 0)} | 제목 점수: {item.get('direct_title_score', 0)} | 카테고리 점수: {item.get('direct_cate_score', 0)}")
 
-    # 벡터검색에서 7개 선정 (직접검색과 중복 시 다음 순위로 대체)
-    vector_selections = []
-    current_index = 0
-    
-    # 벡터검색 결과에서 7개를 채울 때까지 반복
-    while len(vector_selections) < 7 and current_index < len(vector_sorted):
-        item = vector_sorted[current_index]
-        code = item.get('상품코드')
-        
-        # 이미 직접검색에서 선정된 상품이면 다음 순위로
-        if code in seen_codes:
-            current_index += 1
-            continue
-            
-        seen_codes.add(code)
-        vector_selections.append(item)
-        raw_candidates.append(item)
-        print(f"\n[방법1] 벡터검색 선정 {len(vector_selections)}/7:")
-        print(f"제목: {item['제목']}")
-        print(f"점수: 벡터={item['vector_rank_score']:.1f}, "
-              f"직접={item['direct_rank_score']:.1f}, "
-              f"최종={item['vector_final_score']:.1f}")
-        
-        current_index += 1
 
-    # 모든 상품을 하나의 리스트로 순차적으로 수집
-    final_results = []
-    seen_codes = set()
-    
-    # 1. 먼저 직접검색 상위 결과들을 3개씩 수집
-    direct_count = 0
-    for item in direct_sorted:
-        if direct_count >= 15:  # 5세트 × 3개 = 15개
+
+
+
+    # ---------- RRF 합산 (가중치 없음) ----------
+    def rrf_score(ranks, k=60):
+        s = 0.0
+        for r in ranks:
+            if r is not None:
+                s += 1.0 / (k + r)
+        return s
+
+
+
+
+
+
+
+
+
+
+
+    for it in vector_items:
+        code = it.get("상품코드")
+        rv = vector_rank.get(code)       # 벡터 순위
+        rt = title_rank.get(code)        # 제목 직접매칭 순위
+        rc = cate_rank.get(code)         # 카테고리 직접매칭 순위
+        re_cat = it.get("cat_emb_rank")         # 카테고리 임베딩 순위 (문자열 매칭으로 조회된 정수)
+
+        # 텍스트만 RRF
+        it["rrf_text_only"]   = rrf_score([rt, rc])
+
+        # 텍스트 + 카테고리 임베딩 RRF
+        it["rrf_text_plus_catEmb"] = rrf_score([rt, rc, re_cat])
+
+        # 벡터까지 포함 (최종 추천용)
+        it["rrf_all"] = rrf_score([rv, rt, rc, re_cat])
+
+    # 3) RRF 점수 계산 후 결과 출력 (RRF 계산 후 벡터와 점수를 출력)
+    print("\n[방법1/RRF] RRF 점수 계산 후 결과:")
+    for idx, item in enumerate(vector_items[:10], 1):  # 상위 10개 출력
+        print(f"{idx}. {item['제목']} | {item['카테고리']} | RRF(텍스트만): {item['rrf_text_only']:.6f} | RRF(텍스트+카테고리): {item['rrf_text_plus_catEmb']:.6f} | RRF(전체): {item['rrf_all']:.6f}")
+
+
+
+
+
+    # ---------- 최종 정렬: 벡터 포함 RRF(또는 텍스트만 RRF로 바꿔도 됨) ----------
+    final_sorted = sorted(vector_items, key=lambda x: x["rrf_all"], reverse=True)
+
+    final_results, seen_codes = [], set()
+    for it in final_sorted:
+        if len(final_results) >= 40:
             break
-        code = item.get('상품코드')
-        if code and code not in seen_codes:
-            if item['direct_rank_score'] == 0:  # 직접 검색 점수가 0점이면 건너뛰기
-                continue
-            seen_codes.add(code)
-            final_results.append(item)
-            direct_count += 1
-            
-    # 2. 그 다음 벡터검색 결과들을 7개씩 수집
-    vector_count = 0
-    for item in vector_sorted:
-        if vector_count >= 35:  # 5세트 × 7개 = 35개
-            break
-        code = item.get('상품코드')
+        code = it.get("상품코드")
         if code and code not in seen_codes:
             seen_codes.add(code)
-            final_results.append(item)
-            vector_count += 1
-    
-    # 3. 10개씩 세트로 분할
+            final_results.append(it)
+
     all_sets = []
     for i in range(0, len(final_results), 10):
-        current_set = final_results[i:i+10]
-        if len(current_set) == 10:  # 완전한 세트만 추가
-            all_sets.append(current_set)
-    
-    # 모든 세트 출력
-    print(f"\n[방법1] 전체 {len(all_sets)}개 세트 구성 완료")
-    for set_num, set_items in enumerate(all_sets, 1):
-        print(f"\n=== 세트 {set_num} (총 {len(set_items)}개 상품) ===")
-        for idx, item in enumerate(set_items, 1):
-            print(f"\n{idx}. {item['제목']}")
-            print(f"   카테고리: {item['카테고리']}")
-            print(f"   가격: {item['가격']:,}원")
-            print(f"   점수: 벡터={item['vector_rank_score']:.1f}, "
-                  f"직접={item['direct_rank_score']:.1f}, "
-                  f"최종={item['vector_final_score']:.1f}")
-    
-    print(f"\n[방법1] 총 상품 수: {sum(len(s) for s in all_sets)}개")
-    print("\n[방법1] 최종 선정 10개 리스트:", *[(item['상품코드'], item['제목'], item['가격']) for item in all_sets[0]], sep="\n")
-    print("\n[방법1] 2번째 최종 선정 10개 리스트:", *[(item['상품코드'], item['제목'], item['가격']) for item in all_sets[1]], sep="\n")
-    print("\n[방법1] 3번째 최종 선정 10개 리스트:", *[(item['상품코드'], item['제목'], item['가격']) for item in all_sets[2]], sep="\n")
+        block = final_results[i:i+10]
+        if len(block) == 10:
+            all_sets.append(block)
+
+    print(f"\n[방법1/RRF] 세트 수: {len(all_sets)}  (총 {sum(len(s) for s in all_sets)}개)")
+    if all_sets:
+        print("\n[방법1/RRF] 세트1 미리보기")
+        for idx, it in enumerate(all_sets[0], 1):
+            print(f"{idx}. {it['제목']} | {it['카테고리']} | {it['가격']:,}원 | RRF={it['rrf_all']:.6f}")
+
+
+    # 4) 최종 결과 출력
+    print("\n[방법1/RRF] 최종 결과:")
+    for idx, item in enumerate(final_results[:10], 1):  # 상위 10개 출력
+        print(f"{idx}. {item['제목']} | {item['카테고리']} | RRF: {item['rrf_all']:.6f} | 가격: {item['가격']:,}원")
 
 
 
 
 
 
-    #################################################################
-    #                          방법 1 끝                             #
-    #################################################################
+    # #################################################################
+    # #                         NEW 방법 1 끝                             #
+    # #################################################################
 
 
     #################################################################
@@ -1730,54 +1841,69 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
+###리랭커 구간 추가 방법1의 final_results를 실제 사용자 문장과 유사 비교해서 리랭커 실시 Start###
+
+    def rerank_results(
+        query: str,
+        results: List[Dict],
+        top_k: int = 40,
+        title_key: str = "제목",
+        cate_key: str = "카테고리",
+        model_name: str = "BAAI/bge-reranker-v2-m3",
+        batch_size: int = 64,
+        normalize: bool = True,   # softmax 대신 pair별 점수 정규화 옵션
+        device: Optional[str] = None,  # "cuda" / "cpu" 강제 지정 가능
+        use_fp16: Optional[bool] = None,  # None이면 자동; True면 반정밀
+    ) -> List[Dict]:
+        
+        reranked = []
+        return reranked
+
+    
+
+    print("리랭커 전 final_results 데이터 정보")
+    for idx, item in enumerate(final_results[:40], 1):
+        print(f"{idx}. {item['제목']} | {item['카테고리']} ")
+
+
+    # # external_search_and_generate_response 함수 내에서 final_results 처리 전에 추가
+    # final_results = rerank_results(
+    #     query=query,  # 원본 사용자 쿼리 사용
+    #     results=final_results,
+    #     top_k=40
+    # )
+    # ###리랭커 구간 추가 방법1의 final_results를 실제 사용자 문장과 유사 비교해서 리랭커 실시 END###
+    # print("리랭커 후 final_results 데이터 정보")
+    # for idx, item in enumerate(final_results[:40], 1):
+    #     print(f"{idx}. {item['제목']} | {item['카테고리']} ")
+
+    #################################################################
 
 
 
+    # (참고) products_text는 이미 f-string으로 잘 만들고 있음
+    products_text = "\n".join([
+        f"- 코드: {p['상품코드']} | 제목: {p['제목']} | 가격: {p['가격']:,}원 | 카테고리: {p['카테고리']}"
+        for p in all_sets[0]
+    ])
 
+    # 1) 템플릿을 바로 f-string으로
+    prompt = f"""
+    **무조건 어떤 언어가 들어와도 {target_lang}로만 답변하세요!반드시**
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # 모든 상품 정보를 담은 리스트를 LLM에 전달 방법1과 방법2에 합친 10개의 리스트만 보냄.
-    prompt_template = """
-    답변은 반드시 "{target_lang}"로 해주세요.
-    당신은 고객의 니즈를 정확히 파악하는 프리미엄 쇼핑몰의 VIP 상품 추천 전문가입니다.
+    답변 언어는 무조건 {target_lang}로만 작성해주세요. 다른 언어, 혼합 표현 절대 금지.
+    당신은 고객의 니즈를 정확히 파악하는 프리미엄 온라인 쇼핑몰의 VIP 상품 추천 전문가입니다.
     주어진 상품 목록을 바탕으로, 고객이 더 나은 선택을 할 수 있도록 도와주세요.
 
     [매우 중요]
-    - 고객 검색어("{query}")의 의미를 임의로 확장/추정/대체하지 마세요.
-    - 아래 '카테고리'는 후보이며, 사실 여부를 먼저 확인하는 질문부터 하세요.
     - 특정 품목/모델로 단정하지 말고, 후보 리스트의 특징을 근거로 질문하세요.
-    - 한글은 200~250자,영어도 200자 내외 한 문단으로 작성하세요.
 
-    현재 상황:
-    - 고객 검색어: "{query}"
+    - 고객이 원하는 상품을 정확히 찾을 수 있도록, 후보 상품의 특징을 활용해 고객의 선호를 파악하는 질문을 작성하세요.
     - 현재 시즌: {season}
 
     후보 상품 목록:
-    {products}
+    {products_text}
+
 
     요청사항:
     1) 후보 상품의 제목/설명에서 서로를 구분해주는 특징 키워드 3~5개를 추출하세요.
@@ -1785,7 +1911,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - 재질/마감: 가죽/스테인리스/TPU/친환경 등
     - 구성/형태: 세트/단품, 접이식, 휴대용, 벽걸이, 2+1 구성 등
     - 호환/범용/시즌: 정품/호환, 규격·사이즈, 여름/겨울 등
-    2) 그 특징을 활용해 고객 의도 확인과 선호 파악을 위한 '확인형 질문'을 반드시!
+    2) 그 특징을 활용해 고객 의도 확인과 선호 파악을 위한 '확인형 질문'을 반드시! 한글은 200~250자,영어도 200자 내외 한 문단으로 작성하세요.
     - 예시 어조: "후보를 보니 [특징A/특징B/특징C] 옵션이 보이는데, 이런 조건이 필요하신가요?"
     - 본품인지 관련품·소모품·세트·서비스인지도 자연스럽게 확인하세요.
     - 가격대(프리미엄/일반/실속), 디자인, 용도, 재질, 브랜드 선호, 계절감, 옵션 유무를 과도한 나열 없이 자연스럽게 묻으세요.
@@ -1794,49 +1920,25 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     5) 아래 예시는 참고만 하며, 그대로 복사하지 말고 실제 후보의 특징으로 대체하세요.
 
     답변 형식(단락 예시):
-    후보를 보니 [특징A/특징B/특징C] 같은 선택지가 보입니다. 이러한 조건이 필요하신가요, 아니면 심플한 구성이 더 좋으실까요? 사용하실 환경과 선호 가격대(프리미엄/실속), 디자인·재질, 그리고 본품/관련품 중 어떤 쪽을 찾으시는지도 알려주시면 더 정확히 추천해 드리겠습니다.
+    심플한 구성이 더 좋으실까요? 사용하실 환경과 선호 가격대(프리미엄/실속), 디자인·재질, 그리고 본품/관련품 중 어떤 쪽을 찾으시는지도 알려주시면 더 정확히 추천해 드리겠습니다.
+    
+    **무조건 어떤 언어가 들어와도 {target_lang}로만 답변하세요!반드시**
 
     """
-    clean = ""
 
-    #방법1의 상품 리스트 : all_products
+    print("target_lang->", target_lang)
 
-    # 방법1과방법2의 모두 합친결과리스트 : final_results
-    # 방법1과 방법2의 결과를 모두 담을 리스트
-
-
-    # # 전체 상품 정보 포맷팅
-    # products_text = "\n".join([
-    #     f"- 코드: {p['상품코드']} | 제목: {p['제목']} | 가격: {p['가격']:,}원 | 카테고리: {p['카테고리']}"
-    #     for p in final_results
-    # ])
-    # 전체 상품 정보 포맷팅  방법1만 프롬프터해서 결과 보기 위한 임시
-    products_text = "\n".join([
-        f"- 코드: {p['상품코드']} | 제목: {p['제목']} | 가격: {p['가격']:,}원 | 카테고리: {p['카테고리']}"
-        for p in all_sets[0]
-    ])
-
-
-    ####프롬프터 비용 안뜨게 하기 위해 일부로 주석 처리.####
-    # LLM 프롬프트 구성 (카테고리 목록 포함)
-    prompt = prompt_template.format(
-        target_lang=target_lang,
-        query=preprocessed_query,
-        season=season,
-        products=products_text
-    )
-    ####프롬프터 비용 안뜨게 하기 위해 일부로 주석 처리.####
-
-
-    # LLM 한 번 호출
+    # 2) 호출부 동일 (system에 실어 보내는 현재 구조 유지)
     response = client.chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "system", "content": prompt}],
         temperature=0
     )
+
     txt1 = response.choices[0].message.content or ""
     clean = txt1.strip()
     print(f"[Top2-Stage] 전체 카테고리 추가 질문:\n{clean}\n")
+
     
  
 
@@ -1844,10 +1946,19 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     seen_codes = set()
 
     # 방법1과 방법2의 결합
-    sorted_items = sorted(vector_items, key=lambda x: x['direct_final_score'], reverse=True)
+    # sorted_items = sorted(vector_items, key=lambda x: x['direct_final_score'], reverse=True)
+
+
+
+
+
+
+
+
+
 
     # 상위 40개 선택 (중복 제거)
-    for item in sorted_items:
+    for item in final_results:
         if len(final_results) >= 40:  # 최대 40개로 제한
             break
             
@@ -1863,8 +1974,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         print(f"\n{idx}. {item['제목']}")
         print(f"   카테고리: {item['카테고리']}")
         print(f"   가격: {item['가격']:,}원")
-        print(f"   직접오리지널점수 점수: {item['direct_match_score']:.1f}")
-        print(f"   최종점수: {item['direct_final_score']:.1f}")
+        # print(f"   직접오리지널점수 점수: {item['direct_match_score']:.1f}")
+        # print(f"   최종점수: {item['direct_final_score']:.1f}")
 
     # 상품 캐시에 저장
     for info in final_results:
@@ -2049,7 +2160,6 @@ async def debug_search(data: DebugRequest, request: Request):
         user_agent = request.headers.get('user-agent', '')
         
         # 사용자 ID 생성 또는 가져오기
-        
         user_id = event_manager.get_or_create_user(session_id, ip_address, user_agent)
         
         # 검색 실행
@@ -2531,4 +2641,4 @@ if __name__ == '__main__':
     debug = True
     
     print(f"🚀 FastAPI 서버 시작: {host}:{port} (debug={debug})")
-    uvicorn.run("app:app", host=host, port=port, reload=debug)
+    uvicorn.run("app_방법1완료:app", host=host, port=port, reload=debug)
