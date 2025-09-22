@@ -381,20 +381,6 @@ class Ranker_DirectSearch:
     def _similarity(self, a: str, b: str) -> float:
         return difflib.SequenceMatcher(None, a, b).ratio()
 
-    # def _best_weight(self, kw: str, item_tokens: List[str]) -> float:
-    #     if not item_tokens: return self.W_MISS
-    #     if any(kw == t for t in item_tokens): return self.W_EXACT
-    #     has_partial = any((kw in t) or (t in kw) for t in item_tokens)
-    #     best_sim = 0.0
-    #     for t in item_tokens:
-    #         s = self._similarity(kw, t)
-    #         if s > best_sim:
-    #             best_sim = s
-    #             if best_sim >= self.near_threshold:
-    #                 return self.W_NEAR  # 근접이 부분보다 우선
-    #     if has_partial: return self.W_PART
-    #     return self.W_MISS
-
     ######### [변경] 계단식 → 연속 가중치 매핑
     def _best_weight(self, kw: str, item_tokens: List[str]) -> float:
         if not item_tokens:
@@ -560,19 +546,134 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     lang_code = raw.lower().split("-")[0]
     print("[Debug] lang_code →", lang_code)   # ← 이 줄 추가!
 
-    #가격을 이해하는 매핑(추후에 넣으면 좋은 가격 포함 검색 일단 안씀.)
-    pattern = re.compile(r'(\d+)[^\d]*원\s*(이하|미만|이상|초과)')
-    m = pattern.search(query)
-    if m:
-        amount = int(m.group(1))
-        comp  = m.group(2)
-        # 부등호 매핑
-        op_map = {"이하":"<=", "미만":"<", "이상":">=", "초과":">"}
-        price_op = op_map[comp]
-        price_cond = f"market_price {price_op} {amount}"
-    else:
-        # 디폴트: 제한 없음
-        price_cond = None
+    # 가격 조건 처리 함수
+    def extract_price_condition(text: str) -> Optional[str]:
+        # 숫자 단위 정규화
+        def normalize_price_units(text: str) -> str:
+            # 한글 단위
+            kr_unit_map = {
+                "천": "000",
+                "만": "0000",
+                "십만": "00000",
+                "백만": "000000",
+                "천만": "0000000",
+                "억": "00000000"
+            }
+            # 영어 단위
+            en_unit_map = {
+                "k": "000",
+                "thousand": "000",
+                "m": "000000",
+                "million": "000000"
+            }
+            
+            # 숫자가 없는 "만원" 처리
+            text = re.sub(r'(?<!\d)만원', '10000원', text)
+            
+            # 한글 단위 변환 패턴 개선
+            for unit, zeros in kr_unit_map.items():
+                pattern = f'(\d+)\s*{unit}(?:원)?'  # "원" 옵션으로 처리
+                text = re.sub(pattern, lambda m: f"{m.group(1)}{zeros}", text)
+            
+            # 영어 단위 변환 (대소문자 무관)
+            text = text.lower()
+            for unit, zeros in en_unit_map.items():
+                pattern = f'(\d+)\s*{unit}'
+                text = re.sub(pattern, lambda m: f"{m.group(1)}{zeros}", text)
+            
+            # 모든 숫자를 원 단위로 통일
+            text = re.sub(r'(\d+)(?:won|dollars|usd)', r'\1원', text)
+            
+            print(f"[Debug] normalize_price_units 결과: {text}")  # 디버그 로그 추가
+            return text
+
+        # 쿼리 정규화 및 디버깅
+        query = normalize_price_units(text.lower())
+        print(f"[Debug] 정규화된 쿼리: {query}")
+
+        # 가격 범위 패턴 (한글 + 영어)
+        range_patterns = [
+            # 한글 복합 범위 패턴
+            r'(\d+)[^\d]*원?\s*이하\s*(\d+)[^\d]*원?\s*이상',  # "2만원 이하 1만원 이상"
+            r'(\d+)[^\d]*원?\s*초과\s*(\d+)[^\d]*원?\s*미만',  # "1만원 초과 2만원 미만"
+            r'(\d+)[^\d]*원?\s*(?:~|에서|부터)\s*(\d+)[^\d]*원?',
+            # 영어 범위 패턴
+            r'between\s*(\d+)\s*and\s*(\d+)(?:\s*원?)',
+            r'from\s*(\d+)\s*to\s*(\d+)(?:\s*원?)',
+            r'(\d+)\s*(?:to|-|~)\s*(\d+)(?:\s*원?)',
+        ]
+
+        # 단일 가격 패턴 (한글 + 영어)
+        single_patterns = [
+            # 한글 패턴
+            r'(\d+)[^\d]*원?(?:\s*)(이하|미만|이상|초과)',
+            # 영어 패턴
+            r'(?:under|below|less than|up to)\s*(\d+)(?:\s*원?)',
+            r'(?:over|above|more than|at least)\s*(\d+)(?:\s*원?)',
+            r'(\d+)(?:\s*원?)\s*(?:or less|or more)',
+            # 단순 숫자+원 패턴 (이상으로 해석)
+            r'(\d+)[^\d]*원\s*'
+        ]
+
+        # 연산자 매핑
+        op_map_kr = {"이하": "<=", "미만": "<", "이상": ">=", "초과": ">"}
+        op_map_en = {
+            "under": "<", "below": "<", "less than": "<", "up to": "<=",
+            "over": ">", "above": ">", "more than": ">", "at least": ">=",
+            "or less": "<=", "or more": ">="
+        }
+
+        try:
+            # 1. 범위 검색 시도
+            for pattern in range_patterns:
+                m = re.search(pattern, query)
+                if m:
+                    # "이하-이상" 패턴인 경우 순서 바꿔서 처리
+                    if "이하" in pattern and "이상" in pattern:
+                        max_price = int(m.group(1))  # 2만원 (이하)
+                        min_price = int(m.group(2))  # 1만원 (이상)
+                    else:
+                        min_price = int(m.group(1))
+                        max_price = int(m.group(2))
+                    print(f"[Debug] 가격 범위 감지: {min_price}원 ~ {max_price}원")
+                    return f"market_price >= {min_price} && market_price <= {max_price}"
+
+            # 2. 단일 가격 검색 시도
+            for pattern in single_patterns:
+                m = re.search(pattern, query)
+                if m:
+                    # 한글 패턴 매칭
+                    amount = int(m.group(1))
+                    comp = m.group(2) if len(m.groups()) > 1 else None
+
+                    # "원" 패턴은 "이상"으로 처리 (예: "1만원" → "1만원 이상")
+                    if not comp:
+                        if "원" in pattern:
+                            print(f"[Debug] 단순 가격 감지: {amount}원 (이상으로 처리)")
+                            return f"market_price >= {amount}"
+                        continue
+
+                    # 한글 연산자
+                    if comp in op_map_kr:
+                        price_op = op_map_kr[comp]
+                        print(f"[Debug] 한글 가격 조건 감지: {amount}원 {comp}")
+                        return f"market_price {price_op} {amount}"
+
+                    # 영어 연산자
+                    for op_text, op_symbol in op_map_en.items():
+                        if op_text in query.lower():
+                            print(f"[Debug] 영어 가격 조건 감지: {op_text} {amount}")
+                            return f"market_price {op_symbol} {amount}"
+
+        except Exception as e:
+            print(f"[Warning] 가격 조건 처리 중 오류 발생: {str(e)}")
+            return None
+
+        return None
+
+    # 가격 조건 추출
+    price_cond = extract_price_condition(query)
+    print(f"[Debug] 최종 가격 조건: {price_cond if price_cond else '제한 없음'}")
 
 
     # 2) 언어 코드 → 사람말 매핑
@@ -799,9 +900,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             Preprocessed Query: "<전처리된_쿼리(핵심 품목 + 유의미 속성만, ‘용’ 제거 후 표준형)>"
         """    
     )
-
-    if price_cond:
-        system_prompt += f"\n⚠️ 사용자 요청 조건: 가격은 **{amount}원 {comp}** ({price_cond})인 상품만 고려하세요.\n"
 
 
 
@@ -1291,6 +1389,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         anns_field="emb",
         param={"metric_type":"L2","params":{"nprobe":64}},
         limit=1000,
+        expr=price_cond,  # 가격 조건 추가
         output_fields=[
             "product_code","category_code","category_name","market_product_name",
             "market_price","shipping_fee","shipping_type","max_quantity",
@@ -1298,7 +1397,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             "origin","keywords","description","return_shipping_fee",
         ]
     )
+    print(f"[Debug] 가격 조건: {price_cond if price_cond else '제한 없음'}")
 
+    
     # 검색 결과 -> dict 리스트
     vector_items = []
     for hits in vector_hits_1000:
@@ -1348,10 +1449,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # 1) RRF 점수 계산 전 결과 출력 (벡터 매칭 점수 및 직접 점수 출력)
     print("\n[방법1/RRF] RRF 점수 계산 전 결과:")
     for idx, item in enumerate(vector_items[:10], 1):  # 상위 10개 출력
-        print(f"{idx}. {item['제목']} | {item['카테고리']} | 벡터 점수: {item.get('vector_match_score', 0)} | 제목 점수: {item.get('direct_title_score', 0)} | 카테고리 점수: {item.get('direct_cate_score', 0)}")
-
-
-
+        print(f"{idx}. {item['제목']} | {item['카테고리']} | 벡터 점수: {item.get('vector_match_score', 0)} | 제목 직접 점수: {item.get('direct_title_score', 0)} | 카테고리 직접점수: {item.get('direct_cate_score', 0)} | 카테고리 임베딩 점수: {item.get('cat_emb_rank')}")
 
 
     # ---------- RRF 합산 (가중치 없음) ----------
@@ -1361,14 +1459,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             if r is not None:
                 s += 1.0 / (k + r)
         return s
-
-
-
-
-
-
-
-
 
 
 
@@ -2142,6 +2232,7 @@ async def popular_products(days: int = 7, limit: int = 20):
 class DebugRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
+    clarify_answer: Optional[str] = None   # ← 추가: 재질문 답변(있으면 2턴째로 처리)
 
 @app.post('/debug-search')
 async def debug_search(data: DebugRequest, request: Request):
