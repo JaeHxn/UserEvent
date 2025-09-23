@@ -76,7 +76,7 @@ REDIS_URL = "redis://localhost:6379/0"                    # ← 환경변수에�
 COLLECTION = "ownerclan"            # Milvus 컬렉션 이름
 MILVUS_HOST = os.getenv('MILVUS_HOST', '114.110.135.96')
 MILVUS_PORT = os.getenv('MILVUS_PORT', '19530')
-LLM_MODEL  = "gpt-4.1-mini"
+LLM_MODEL  = "gpt-4.1-mini-2025-04-14"
 EMB_MODEL  = "text-embedding-3-small"
 
 # 클라이언트 및 래퍼
@@ -550,41 +550,49 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     def extract_price_condition(text: str) -> Optional[str]:
         # 숫자 단위 정규화
         def normalize_price_units(text: str) -> str:
-            # 한글 단위
+            # 한글 단위와 기본값 매핑
             kr_unit_map = {
-                "천": "000",
-                "만": "0000",
-                "십만": "00000",
-                "백만": "000000",
-                "천만": "0000000",
-                "억": "00000000"
+                "천": ("000", "1000"),
+                "만": ("0000", "10000"),
+                "십만": ("00000", "100000"),
+                "백만": ("000000", "1000000"),
+                "천만": ("0000000", "10000000"),
+                "억": ("00000000", "100000000")
             }
-            # 영어 단위
+            # 영어 단위와 기본값 매핑
             en_unit_map = {
-                "k": "000",
-                "thousand": "000",
-                "m": "000000",
-                "million": "000000"
+                "k": ("000", "1000"),
+                "thousand": ("000", "1000"),
+                "m": ("000000", "1000000"),
+                "million": ("000000", "1000000")
             }
             
-            # 숫자가 없는 "만원" 처리
-            text = re.sub(r'(?<!\d)만원', '10000원', text)
+            text = text.lower()  # 대소문자 통일
             
-            # 한글 단위 변환 패턴 개선
-            for unit, zeros in kr_unit_map.items():
-                pattern = f'(\d+)\s*{unit}(?:원)?'  # "원" 옵션으로 처리
+            # 1. 숫자가 없는 한글 단위 처리
+            for unit, (zeros, default) in kr_unit_map.items():
+                # 단위원 패턴 (예: "만원", "십만원")
+                pattern = f'(?<!\d){unit}원'
+                text = re.sub(pattern, f'{default}원', text)
+                
+                # 숫자+단위 패턴 (예: "1만원", "5십만원")
+                pattern = f'(\d+)\s*{unit}(?:원)?'
                 text = re.sub(pattern, lambda m: f"{m.group(1)}{zeros}", text)
             
-            # 영어 단위 변환 (대소문자 무관)
-            text = text.lower()
-            for unit, zeros in en_unit_map.items():
+            # 2. 숫자가 없는 영어 단위 처리
+            for unit, (zeros, default) in en_unit_map.items():
+                # 단위만 있는 패턴 (예: "k", "million")
+                pattern = f'(?<!\d){unit}'
+                text = re.sub(pattern, default, text)
+                
+                # 숫자+단위 패턴 (예: "1k", "5million")
                 pattern = f'(\d+)\s*{unit}'
                 text = re.sub(pattern, lambda m: f"{m.group(1)}{zeros}", text)
             
-            # 모든 숫자를 원 단위로 통일
-            text = re.sub(r'(\d+)(?:won|dollars|usd)', r'\1원', text)
+            # 3. 통화 단위 통일
+            text = re.sub(r'(\d+)(?:won|dollars|usd|원)', r'\1원', text)
             
-            print(f"[Debug] normalize_price_units 결과: {text}")  # 디버그 로그 추가
+            print(f"[Debug] normalize_price_units 입력: {text}")
             return text
 
         # 쿼리 정규화 및 디버깅
@@ -593,14 +601,34 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
         # 가격 범위 패턴 (한글 + 영어)
         range_patterns = [
-            # 한글 복합 범위 패턴
-            r'(\d+)[^\d]*원?\s*이하\s*(\d+)[^\d]*원?\s*이상',  # "2만원 이하 1만원 이상"
-            r'(\d+)[^\d]*원?\s*초과\s*(\d+)[^\d]*원?\s*미만',  # "1만원 초과 2만원 미만"
-            r'(\d+)[^\d]*원?\s*(?:~|에서|부터)\s*(\d+)[^\d]*원?',
-            # 영어 범위 패턴
-            r'between\s*(\d+)\s*and\s*(\d+)(?:\s*원?)',
-            r'from\s*(\d+)\s*to\s*(\d+)(?:\s*원?)',
-            r'(\d+)\s*(?:to|-|~)\s*(\d+)(?:\s*원?)',
+            # 한글 복합 범위 패턴 (이상/이하)
+            r'(\d+)[^\d]*원?\s*이상\s*(\d+)[^\d]*원?\s*이하',   # "20000 이상 30000 이하"
+            r'(\d+)[^\d]*이상\s*(\d+)[^\d]*이하',              # "20000이상 30000이하" (원 없는 버전)
+            r'(\d+)[^\d]*원\s*이상\s*(\d+)[^\d]*원\s*이하',    # "20000원 이상 30000원 이하"
+            
+            # 한글 복합 범위 패턴 (초과/미만)
+            r'(\d+)[^\d]*원?\s*초과\s*(\d+)[^\d]*원?\s*미만',   # "20000 초과 30000 미만"
+            r'(\d+)[^\d]*초과\s*(\d+)[^\d]*미만',              # "20000초과 30000미만"
+            r'(\d+)[^\d]*원\s*초과\s*(\d+)[^\d]*원\s*미만',    # "20000원 초과 30000원 미만"
+            
+            # 한글 범위 구분자 패턴
+            r'(\d+)[^\d]*원?\s*(?:~|에서|부터)\s*(\d+)[^\d]*원?',    # "20000~30000원"
+            r'(\d+)[^\d]*원?\s*부터\s*(\d+)[^\d]*원?\s*까지',        # "20000원부터 30000원까지"
+            r'(\d+)[^\d]*에서\s*(\d+)[^\d]*원?\s*사이',             # "20000에서 30000원 사이"
+            
+            # 영어 범위 패턴 (기본)
+            r'between\s*(\d+)\s*and\s*(\d+)(?:\s*원?)',             # "between 20000 and 30000"
+            r'from\s*(\d+)\s*to\s*(\d+)(?:\s*원?)',                # "from 20000 to 30000"
+            r'(\d+)\s*(?:to|-|~)\s*(\d+)(?:\s*원?)',               # "20000 to 30000", "20000-30000"
+            
+            # 영어 범위 패턴 (상세)
+            r'(\d+)\s*(?:or\s+more)\s+(?:but|and)\s+(?:less\s+than|under|below)\s*(\d+)',  # "20000 or more but less than 30000"
+            r'(?:more\s+than|over|above)\s*(\d+)\s*(?:but|and)\s*(?:less\s+than|under|below)\s*(\d+)',  # "more than 20000 but less than 30000"
+            r'(\d+)\s*(?:or\s+more)\s+(?:but|and)\s+(?:not\s+more\s+than|no\s+more\s+than)\s*(\d+)',   # "20000 or more but not more than 30000"
+            
+            # 통화 단위 포함 패턴
+            r'(?:USD|USD\$|\$)\s*(\d+)\s*(?:to|-|~)\s*(?:USD|USD\$|\$)\s*(\d+)',  # "$20000 to $30000"
+            r'(?:KRW|₩)\s*(\d+)\s*(?:to|-|~)\s*(?:KRW|₩)\s*(\d+)',               # "₩20000 to ₩30000"
         ]
 
         # 단일 가격 패턴 (한글 + 영어)
@@ -628,13 +656,14 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             for pattern in range_patterns:
                 m = re.search(pattern, query)
                 if m:
-                    # "이하-이상" 패턴인 경우 순서 바꿔서 처리
-                    if "이하" in pattern and "이상" in pattern:
-                        max_price = int(m.group(1))  # 2만원 (이하)
-                        min_price = int(m.group(2))  # 1만원 (이상)
-                    else:
-                        min_price = int(m.group(1))
-                        max_price = int(m.group(2))
+                    # "이상-이하" 또는 기타 범위 패턴 모두 일관되게 처리
+                    min_price = int(m.group(1))  # 첫 번째 숫자
+                    max_price = int(m.group(2))  # 두 번째 숫자
+                    
+                    # 가격 순서가 뒤바뀐 경우 교정
+                    if min_price > max_price:
+                        min_price, max_price = max_price, min_price
+                        
                     print(f"[Debug] 가격 범위 감지: {min_price}원 ~ {max_price}원")
                     return f"market_price >= {min_price} && market_price <= {max_price}"
 
@@ -850,14 +879,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     except NameError:
         season = "미정"
 
-    # 적용: 4계절 모두
-    # if season in ("봄","여름","가을","겨울"):
-    #     # sorted_cats는 이미 시즌 보정이 적용된 상태이므로 별도 정렬 불필요
-    #     print("🛠 시즌 보정 적용된 카테고리 순위:")
-    #     for i,(name,dist) in enumerate(sorted_cats,1):
-    #         adj_score = get_adjusted_score(name, dist, season)
-    #         print(f"  {i}. {name} | adj_L2={adj_score:.6f}")
-
 
     # 대화 이력 가져오기
     history_messages = [msg.content for msg in session_history.messages]
@@ -868,8 +889,19 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             당신은 (1) 검색 엔진의 전처리를 담당하는 AI이자, (2) 쇼핑몰 검색 및 분류 전문가입니다.
             입력 언어가 무엇이든 먼저 한국어로 의미 보존 번역을 수행합니다.
             
-            [대화 컨텍스트]
-            {conversation_context}를 잘보고 사용자가 무엇을 찾고자하는지 파악한 다음 그 키워드를 구성해서 다음작업을 진행하세요.!!
+            [대화 컨텍스트 처리 원칙]
+            1. 이전 대화 이력:
+            {conversation_context}
+            
+            2. 컨텍스트 활용 규칙:
+            - 현재 사용자의 입력이 "~안에서", "~중에서", "그중에", "거기서" 등의 문구를 포함하면 반드시 이전 맥락을 참조할 것
+            - 이전에 언급된 상품/카테고리/조건들을 모두 포함하여 검색 쿼리 구성
+            - 대화 맥락상 이전 검색의 범위를 좁히는 경우, 이전 조건들을 모두 보존
+            - 새로운 조건이 추가되면 기존 조건과 함께 누적하여 처리
+            
+            3. 검색어 구성:
+            - 이전 맥락 참조가 필요한 경우: [이전 검색어의 핵심 키워드들] + [현재 추가된 조건]
+            - 독립적인 새 검색인 경우: 현재 입력만으로 검색어 구성
 
 
             [전처리 원칙]
@@ -891,13 +923,39 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             - 핵심 품목이 불명확하고 제외만 존재할 경우, **추정하지 말고 원문 유지**(의미 보존 원칙).
 
             [중요: 의미 보존]
-        - “<대상>에게 좋은/에 좋은/맞는/추천”은 의도 핵심이므로 반드시 유지(필요 시 ‘추천’으로 표준화 가능)
-        - 핵심 품목이 명확하지 않으면 원문 유지(축약·추정 금지)
+            - “<대상>에게 좋은/에 좋은/맞는/추천”은 의도 핵심이므로 반드시 유지(필요 시 ‘추천’으로 표준화 가능)
+            - 핵심 품목이 명확하지 않으면 원문 유지(축약·추정 금지)
+
+            [카테고리 추정 규칙(사전 없음, 1~3단어 엄수, UNKNOWN 금지)]
+            - 목표: 내부 임베딩 매핑용 **카테고리 후보 1~3개** 생성
+            - 각 카테고리는 **공백으로 구분된 1~3개 단어**만 사용. 하이픈/슬래시/쉼표 금지.
+            - 형식(우선순위 높은 순):
+              A) "<성별> <세부유형> <상위군>"  (예: "여성 스니커즈 신발")
+              B) "<성별> <세부유형>"          (예: "남성 러닝화")
+              C) "<세부유형> <상위군>"        (예: "스니커즈 신발")
+            - 표준 토큰 예:
+              * 성별/연령: 여성, 남성, 남녀공용, 아동, 유아
+              * 신발: 스니커즈, 러닝화, 샌들, 슬리퍼, 실내화, 부츠, 힐, 로퍼, 구두, 트레킹화
+              * 상위군(대표): 신발, 의류, 가방, 액세서리, 주방용품, 생활용품, 디지털, 가전, 뷰티, 식품, 스포츠
+              * 동의어 정규화: 운동화→스니커즈, 조깅화→러닝화, 슬립온→스니커즈, 크록스→샌들, 실내슬리퍼→실내화, 하이힐→힐, 등산화→트레킹화
+            - 성별/연령/활동 신호가 있으면 반영(예: “여성”, “러닝”, “실내”)
+            - 색/브랜드/수량/가격/행사 정보는 카테고리 결정에 사용하지 않음(검색 속성으로만 보존)
+            - 길이 초과 위험 시 토큰 우선순위: 성별 > 세부유형 > 상위군 (3단어 초과 시 상위군 생략)
+            - 부정이 축에 걸리면 제외 후 대체 축 채택(“여성 말고 남성 스니커즈” → "남성 스니커즈 신발")
+            - **불명확하거나 상품 비의도 질의여도 반드시 가까운 일반 카테고리로 귀결**:
+              * 패션/잡화 계열 추정 시: "패션 액세서리" 또는 "패션 가방"
+              * 생활 전반: "생활용품"
+              * 전자/모바일 관련: "디지털 액세서리"
+              * 식음료 맥락: "식품 스낵" 또는 "음료"
+              * 가정 내 조리/청소 맥락: "주방용품" 또는 "청소용품"
+              (최소 1개는 반드시 출력)
 
             [출력 규칙(반드시 정확히 준수)]
-            오직 두 줄만 출력, 따옴표 포함. 추가 설명/불릿/번호/코드블록 절대 금지.
+            오직 세 줄만 출력, 따옴표 포함. 추가 설명/불릿/번호/코드블록 절대 금지.
             Raw Query: "<query>"
             Preprocessed Query: "<전처리된_쿼리(핵심 품목 + 유의미 속성만, ‘용’ 제거 후 표준형)>"
+            Categories: "<카테고리 Top1> | <카테고리 Top2> | <카테고리 Top3>"
+            - 각 카테고리는 **정확히 1~3개 단어**여야 함(예: "여성 스니커즈 신발", "남성 로퍼")
         """    
     )
 
@@ -912,11 +970,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     )
     llm_response = resp.choices[0].message.content.strip()
     print("[Debug] LLM full response:\n", llm_response)  # ← 여기에!
-
-
-
-
-
 
     # print("session_history.messages:",session_history.messages)
     # print("session_history:",session_history)
@@ -957,13 +1010,49 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
         # 4) 최종 폴백: 원문
         return fallback
-    
+
+
+
+
+
+
+    # === Categories 추출 (LLM 응답에서 라벨 한 줄만 파싱) ===
+    def extract_categories_simple(llm_text: str):
+        # 1) JSON 응답일 가능성
+        try:
+            obj = json.loads(llm_text)
+            v = obj.get("Categories") or obj.get("categories") or obj.get("카테고리") or obj.get("분류")
+            if isinstance(v, str):
+                raw = v
+            elif isinstance(v, list):
+                return [" ".join(str(x).split()[:3]) for x in v if str(x).strip()][:3]
+            else:
+                raw = None
+        except Exception:
+            raw = None
+
+        # 2) 라벨 라인에서 뽑기:  Categories: "A | B | C"
+        if not raw:
+            m = re.search(r'(?im)^\s*categories\s*:\s*["“]?(.+?)["”]?\s*$', llm_text)
+            if not m:
+                m = re.search(r'^\s*(카테고리|분류)\s*[:=]\s*["“]?(.+?)["”]?\s*$', llm_text, re.M)
+                raw = m.group(2).strip() if m else ""
+            else:
+                raw = m.group(1).strip()
+
+        # 3) 구분자 분리 후 토큰 1~3개로 잘라 정리
+        parts = re.split(r'\s*\|\s*|/|,\s*', raw)
+        parts = [p.strip(' "“”') for p in parts if p and p.strip()]
+        cats  = [" ".join(p.split()[:3]) for p in parts]  # 1~3단어 강제
+        return cats[:3]
+
+    Categories = extract_categories_simple(llm_response)
     terms = extract_preprocessed(llm_response, query)
-    
     preprocessed_query = strip_minus_terms(terms)
 
+    print("[Debug] Categories ->", Categories)
     print("[Debug] Preprocessed Query_Before ->", terms)
-    print("[Debug] Preprocessed Query ->", preprocessed_query)
+    print("[Debug] Preprocessed Query ->", preprocessed_query)   #마이너스 같은걸 빼줌.
 
 
 
@@ -997,13 +1086,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         for i,(name,dist) in enumerate(top5,1):
             print(f"  {i}. {name} | L2={dist:.6f}")
         return top5
-
-    # # 상위 카테고리에 대해 각각 상품 검색 (시즌 보정 적용)
-    def get_adjusted_score(category_name: str, score: float, season: str) -> float:
-        """시즌에 따른 점수 보정"""
-        season_adj = _season_adjust(category_name, season)
-        return score + season_adj
-
+    
     def _has_any(text: str, words) -> bool:
         t = (text or "").lower()
         return any(w.lower() in t for w in words)
