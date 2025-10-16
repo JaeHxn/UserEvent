@@ -12,8 +12,14 @@ from concurrent.futures import ThreadPoolExecutor
 from langdetect import detect
 from collections import defaultdict, Counter
 import math
-from langchain.retrievers.document_compressors import CrossEncoderReranker
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+# langchain 의존성을 선택적으로 import
+try:
+    from langchain.retrievers.document_compressors import CrossEncoderReranker
+    from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+    LANGCHAIN_AVAILABLE = True
+except ImportError:
+    print("[WARNING] langchain not available - some features may be disabled")
+    LANGCHAIN_AVAILABLE = False
 
 import time
 import pandas as pd
@@ -462,10 +468,65 @@ class Ranker_DirectSearch:
 
 
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:
+    # 🔧 재질문 임계값 통일 설정
+    THRESHOLD = 0.90             # 평균 점수 임계값 (이상이면 검색 진행)
+    DIRECT_MATCH_HIGH = 0.8      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
+    FACET_COVERAGE_MIN = 0.35     # 최소 속성 커버리지 (미달 시 재질문)
+    ATTRIBUTE_MIN = 0.40          # 속성 매칭 최소값
+    FACET_SUFFICIENT = 0.50       # 충분한 속성 커버리지
 
+    def calculate_completion_rate(avg_score: float, threshold: float = THRESHOLD) -> tuple:
+        """
+        평균 점수를 기준으로 질문 완성률을 계산
+        THRESHOLD(0.80)을 100%로 기준하여 완성률 산출
+        
+        Args:
+            avg_score: LLM이 준 평균 점수 (0.0~1.0)
+            threshold: 완성 기준 점수 (기본값: 0.80)
+            
+        Returns:
+            tuple: (완성률 비율 0.0~1.0, 완성률 퍼센트 0~100)
+            
+        예시:
+            - avg_score=0.80 → 100% 완성
+            - avg_score=0.64 → 80% 완성  
+            - avg_score=0.40 → 50% 완성
+            - avg_score=0.00 → 0% 완성
+        """
+        if avg_score >= threshold:
+            return 1.0, 100  # 100% 완성 (검색 진행)ㅌ
+        
+        # 0.80을 100%로 기준하여 비례 계산
+        completion_ratio = min(1.0, max(0.0, avg_score / threshold))
+        completion_percent = int(round(completion_ratio * 100))
+        
+        return completion_ratio, completion_percent
 
-
-
+    def format_completion_message(completion_percent: int, avg_score: float, threshold: float = THRESHOLD) -> str:
+        """
+        완성률에 따른 친절한 메시지 생성
+        
+        Args:
+            completion_percent: 완성률 퍼센트 (0~100)
+            avg_score: 평균 점수
+            threshold: 완성 기준 점수
+            
+        Returns:
+            str: 완성률 메시지
+        """
+        if completion_percent >= 100:
+            return f"💯 질문 완성률: {completion_percent}% (검색 실행!)"
+        elif completion_percent >= 80:
+            return f"🎯 질문 완성률: {completion_percent}% (거의 완성)"
+        elif completion_percent >= 60:
+            return f"📈 질문 완성률: {completion_percent}% (조금 더 구체적으로)"
+        elif completion_percent >= 40:
+            return f"📊 질문 완성률: {completion_percent}% (더 자세히 알려주세요)"
+        elif completion_percent >= 20:
+            return f"📉 질문 완성률: {completion_percent}% (많이 부족해요)"
+        else:
+            return f"❓ 질문 완성률: {completion_percent}% (처음부터 다시)"
+    
     collection = Collection(COLLECTION)   #다시 상품 DB 컬렉션으로 연결
     def convert_to_serializable(obj):
         if isinstance(obj, (np.int64, np.int32, np.float32, np.float64)):
@@ -551,12 +612,74 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     # 가격 조건 처리 함수
     def extract_price_condition(text: str) -> Optional[str]:
+        # 🔧 크기/규격 단위 목록 (가격 인식에서 제외)
+        SIZE_UNITS = [
+            # 길이/크기 단위
+            '인치', 'inch', 'cm', '센티', '미터', 'm', 'mm', '밀리미터',
+            # 무게 단위  
+            'kg', '킬로', '그램', 'g', 'ton', '톤',
+            # 용량 단위
+            '리터', 'l', 'ml', '밀리리터', '갤런',
+            # 전자기기 단위
+            '기가', 'gb', 'mb', 'tb', '테라', 'hz', '헤르츠',
+            # 기타 규격
+            '사이즈', 'size', '호', '번', '단', '개', '매', '장', '권', '병', '포'
+        ]
+
+        # 🔧 크기 조건 패턴 먼저 체크 (가격보다 우선 처리)
+        size_condition_patterns = [
+            (r'(\d+(?:\.\d+)?)\s*인치\s*(이하|미만|이상|초과)', "인치"),
+            (r'(\d+(?:\.\d+)?)\s*inch\s*(under|below|over|above)', "inch"),
+            (r'(\d+(?:\.\d+)?)\s*cm\s*(이하|미만|이상|초과)', "cm"),
+            (r'(\d+(?:\.\d+)?)\s*센티\s*(이하|미만|이상|초과)', "cm"),
+            (r'(\d+(?:\.\d+)?)\s*kg\s*(이하|미만|이상|초과)', "kg"),
+            (r'(\d+(?:\.\d+)?)\s*킬로\s*(이하|미만|이상|초과)', "kg"),
+            (r'(\d+(?:\.\d+)?)\s*리터\s*(이하|미만|이상|초과)', "리터"),
+            (r'(\d+(?:\.\d+)?)\s*l\s*(이하|미만|이상|초과)', "리터"),
+        ]
+        
+        op_map = {
+            "이하": "<=", "미만": "<", "이상": ">=", "초과": ">",
+            "under": "<", "below": "<", "over": ">", "above": ">"
+        }
+        
+        query_lower = text.lower()
+        
+        # 크기 조건 체크
+        for pattern, unit in size_condition_patterns:
+            m = re.search(pattern, query_lower)
+            if m:
+                value = float(m.group(1))
+                op_text = m.group(2).strip()
+                operator = op_map.get(op_text)
+                
+                if operator:
+                    print(f"[Debug] 크기 조건 감지: {value}{unit} {op_text} (가격 인식 건너뛰기)")
+                    return f"SIZE_CONDITION_{unit}_{operator}_{value}"  # 특별한 크기 조건 반환
+        
+        # 🔧 가격 조건도 함께 있는지 먼저 체크
+        price_keywords = ['원', '만원', '천원', '억원', '달러', 'dollar', 'usd', '이상', '이하', '미만', '초과', '에서', '사이', '부터', '까지', '~', '-']
+        has_price_keywords = any(keyword in query_lower for keyword in price_keywords)
+        
+        if has_price_keywords:
+            print(f"[Debug] 크기+가격 조건 동시 감지 → 가격 인식 계속 진행")
+            # 가격 인식을 계속 진행
+        else:
+            # 🔧 기타 크기/규격 단위만 있고 가격 키워드가 없는 경우만 가격 인식 건너뛰기
+            size_patterns = [rf'\d+\s*{re.escape(unit)}\b' for unit in SIZE_UNITS]
+            for pattern in size_patterns:
+                if re.search(pattern, query_lower):
+                    print(f"[Debug] 크기/규격 패턴만 감지로 가격 인식 제외: '{pattern}' 매치 in '{text}'")
+                    return None
+        
+
+
         # 숫자 단위 정규화
         def normalize_price_units(text: str) -> str:
 
-                # 소문자 통일
+            # 소문자 통일
             t = text.lower()
-
+            
             # 0) "10,000" 같은 콤마 포함 숫자 → 콤마 제거
             def _strip_commas(m):
                 return m.group(1).replace(",", "")
@@ -932,8 +1055,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     conversation_context = "\n".join([f"이전 대화: {msg}" for msg in history_messages[-10:]]) if history_messages else "이전 대화 없음"
 
 
-
-    # ===== 사용자 의도 파악  LLM 재질문 구간 Start =====
+    # ===== 사용자 의도 파악  LLM 재질문 Start =====
     def _extract_json_block(text: str) -> dict:
         # 1) 코드펜스 제거
         t = text.strip()
@@ -955,19 +1077,72 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             v = 0.0
         return 0.0 if v < 0 else 1.0 if v > 1 else v
 
+    def _build_recent_context(session_history, k: int = 5) -> str:
+        lines = []
+        if not session_history:
+            return ""
+        try:
+            for m in session_history.messages[-20:]:
+                txt = getattr(m, "content", "") or ""
+                if not txt:
+                    continue
+                s = txt.strip()
+                if "[INTENT_GATE]" in s:
+                    continue
+                if s.startswith(("ERROR:", "Traceback", "```", "#", "INFO:", "DEBUG:")):
+                    continue
+                s = s.replace("\n", " ")[:160]
+                if s:
+                    lines.append("- " + s)
+        except Exception:
+            pass
+        return "\n".join(lines[-k:])
+
     def _recompute_route(scores: Dict[str, Any]) -> Tuple[float, str]:
+        """
+        디테일한 점수 계산 및 라우팅 결정
+        정의된 임계값들을 활용한 정교한 판정 시스템
+        """
         d = _clamp01(scores.get("direct_match", 0.0))
         a = _clamp01(scores.get("attribute_match", 0.0))
         c = _clamp01(scores.get("context_match", 0.0))
         b = _clamp01(scores.get("brand_match", 0.0))
-        avg = 0.8*d + 0.1*a + 0.05*c + 0.05*b
-        # 규칙: direct_match ≥ 0.8 → proceed (최우선)
-        if d >= 0.8:
+        
+        # 🎯 가중평균 계산 (direct_match 중심)
+        avg = 0.6*d + 0.2*a + 0.1*c + 0.1*b
+        
+        # 🚀 1차: 높은 직접 매칭 - 단독 통과 가능
+        if d >= DIRECT_MATCH_HIGH:
             route = "proceed"
+            print(f"[Route] 직접매칭 높음({d:.3f}≥{DIRECT_MATCH_HIGH}) → 단독 통과")
+            
+        # 🔍 2차: 속성 매칭 검증
+        elif a >= ATTRIBUTE_MIN and d >= 0.6:
+            # 직접매칭이 중간 이상이고 속성매칭이 충분한 경우
+            route = "proceed"
+            print(f"[Route] 속성매칭 충분({a:.3f}≥{ATTRIBUTE_MIN}) + 직접매칭 중간({d:.3f}≥0.6) → 통과")
+            
+        # 📊 3차: 종합 점수 + 최소 속성 커버리지 검증
+        elif avg >= THRESHOLD * 0.8:  # THRESHOLD의 80% 이상
+            if a >= FACET_COVERAGE_MIN:
+                route = "proceed" 
+                print(f"[Route] 종합점수 높음({avg:.3f}≥{THRESHOLD*0.8:.3f}) + 속성커버 충족({a:.3f}≥{FACET_COVERAGE_MIN}) → 통과")
+            else:
+                route = "clarify"
+                print(f"[Route] 종합점수 높지만 속성커버 부족({a:.3f}<{FACET_COVERAGE_MIN}) → 재질문")
+                
+        # 🎲 4차: 충분한 속성 커버리지가 있는 경우 점수 완화
+        elif a >= FACET_SUFFICIENT and avg >= 0.5:
+            route = "proceed"
+            print(f"[Route] 속성커버 충분({a:.3f}≥{FACET_SUFFICIENT}) + 기본 점수({avg:.3f}≥0.5) → 완화 통과")
+            
+        # ❌ 5차: 그 외 모든 경우 재질문
         else:
-            route = "proceed" if avg >= 0.6 else "clarify"
+            route = "clarify"
+            print(f"[Route] 점수 부족(avg={avg:.3f}, d={d:.3f}, a={a:.3f}) → 재질문")
+        
         return round(avg, 4), route
-
+    
     def _build_recent_context(session_history, k: int = 5) -> str:
         """
         사용자/판매 관련 메시지 위주로 최근 5줄 요약.
@@ -994,6 +1169,195 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             pass
         return "\n".join(lines[-k:])
 
+    def check_direct_search_command(user_query: str) -> bool:
+        """
+        바로검색 명령어가 포함되어 있는지 확인
+        """
+        direct_search_patterns = [
+            '바로검색', '바로 검색', '즉시검색', '즉시 검색',
+            '그냥검색', '그냥 검색', '바로찾아', '바로 찾아',
+            '즉시찾아', '즉시 찾아', '그냥찾아', '그냥 찾아',
+            '바로해', '바로 해'
+        ]
+        
+        query_lower = user_query.lower().replace(' ', '')
+        for pattern in direct_search_patterns:
+            if pattern.replace(' ', '') in query_lower:
+                return True
+        return False
+
+    def analyze_conversation_context(session_history) -> Dict[str, Any]:
+        """
+        이전 대화를 분석하여 종합적인 맥락 정보 추출
+        """
+        context_info = {
+            "main_category": None,
+            "mentioned_attributes": [],
+            "rejected_items": [],
+            "price_mentions": [],
+            "brand_mentions": [],
+            "repeated_queries": [],
+            "clarification_history": []
+        }
+        
+        if not session_history:
+            return context_info
+            
+        try:
+            user_messages = []
+            ai_messages = []
+            
+            for m in session_history.messages[-15:]:  # 최근 15개 메시지 분석
+                content = getattr(m, "content", "") or ""
+                if not content.strip():
+                    continue
+                    
+                if hasattr(m, 'type'):
+                    if m.type == 'human':
+                        user_messages.append(content)
+                    elif m.type == 'ai':
+                        ai_messages.append(content)
+                        
+            # 주요 카테고리 추출
+            categories = ['옷', '의류', '상의', '하의', '신발', '운동화', '구두', '가방', '핸드백', '화장품', '음식', '전자제품']
+            for msg in user_messages:
+                for cat in categories:
+                    if cat in msg:
+                        context_info["main_category"] = cat
+                        break
+                        
+            # 속성 언급 추출
+            attributes = ['색깔', '색상', '크기', '사이즈', '재질', '브랜드', '가격', '저렴', '비싸', '고급', '예쁜', '멋진']
+            for msg in user_messages:
+                for attr in attributes:
+                    if attr in msg and attr not in context_info["mentioned_attributes"]:
+                        context_info["mentioned_attributes"].append(attr)
+                        
+            # 반복 질문 패턴 감지
+            if len(user_messages) >= 2:
+                recent_queries = user_messages[-3:]  # 최근 3개 질문
+                for i, query in enumerate(recent_queries):
+                    if len([q for q in recent_queries if q.strip()[:10] == query.strip()[:10]]) > 1:
+                        context_info["repeated_queries"].append(query[:50])
+                        
+        except Exception as e:
+            print(f"[Context Analysis Error] {e}")
+            
+        return context_info
+
+    def _generate_contextual_clarification(base_question: str, context_analysis: Dict, user_query: str) -> str:
+        """
+        대화 맥락을 고려한 종합적인 재질문 생성
+        """
+        # 구체적인 상위-하위 관계 감지
+        if '옷' in user_query and ('상의' in user_query or '하의' in user_query or '원피스' in user_query):
+            if '상의' in user_query:
+                return "상의 중에서도 어떤 종류를 원하시나요? 1️⃣티셔츠 2️⃣셔츠 3️⃣블라우스 4️⃣니트 5️⃣후드티 6️⃣조끼"
+            elif '하의' in user_query:
+                return "하의 중에서도 어떤 종류를 원하시나요? 1️⃣청바지 2️⃣슬랙스 3️⃣치마 4️⃣레깅스 5️⃣반바지 6️⃣운동복"
+            elif '원피스' in user_query:
+                return "원피스 중에서도 어떤 스타일을 원하시나요? 1️⃣캐주얼 2️⃣정장 3️⃣파티 4️⃣원피스 5️⃣맥시 6️⃣미니"
+                
+        # 반복 질문 감지
+        if len(context_analysis['repeated_queries']) > 0:
+            if context_analysis['main_category']:
+                return f"'{context_analysis['main_category']}' 관련해서 좀 더 구체적으로 어떤 속성(색상, 크기, 용도, 스타일)을 원하시나요? 🤔"
+            else:
+                return "계속 비슷한 질문을 하고 계시네요. 다른 방식으로 설명해주시거나, 용도나 상황을 알려주세요! 💡"
+        
+        # 이미 카테고리가 확정된 경우
+        if context_analysis['main_category']:
+            category = context_analysis['main_category']
+            if '옷' in category or '의류' in category:
+                return "어떤 종류 의류를 찾으시나요? 1️⃣👕상의 2️⃣👖하의 3️⃣👗원피스 4️⃣🧥아우터 5️⃣🩲속옷 6️⃣🧢모자"
+            elif '신발' in category:
+                return "어떤 종류 신발을 찾으시나요? 1️⃣👟운동화 2️⃣👞구두 3️⃣🥿로퍼 4️⃣👠하이힐 5️⃣🥾부츠 6️⃣👡샌들"
+            elif '가방' in category:
+                return "어떤 종류 가방을 찾으시나요? 1️⃣🎒백팩 2️⃣👜핸드백 3️⃣💼서류가방 4️⃣👛지갑 5️⃣🛍️쇼핑백 6️⃣🎁선물가방"
+        
+        # 속성이 이미 언급된 경우
+        if context_analysis['mentioned_attributes']:
+            mentioned = ', '.join(context_analysis['mentioned_attributes'][:3])
+            return f"이미 {mentioned} 관련 정보를 주셨네요. 구체적인 상품명이나 브랜드를 알려주시면 더 정확히 찾을 수 있어요! 🎯"
+        
+        # 기본 재질문 사용
+        return base_question or "어떤 카테고리를 찾으시나요? 1️⃣의류 2️⃣신발 3️⃣가방 4️⃣화장품 5️⃣전자제품 6️⃣기타"
+
+    def _generate_llm_clarification(user_query: str, recent_context: str, context_analysis: Dict, client) -> str:
+        """
+        LLM을 활용한 동적 재질문 생성
+        """
+        main_category = context_analysis.get('main_category', '')
+        mentioned_attrs = context_analysis.get('mentioned_attributes', [])
+        
+        clarification_prompt = f"""
+사용자가 "{user_query}"라고 질문했습니다. 
+이전 대화: {recent_context or '없음'}
+주요 카테고리: {main_category or '불명확'}
+언급된 속성: {mentioned_attrs or '없음'}
+
+사용자가 정확히 원하는 상품을 찾기 위해 매우 구체적이고 자세한 정보를 수집하는 재질문을 생성해주세요.
+
+🎯 재질문 전략 (다층적 정보 수집):
+
+1. 카테고리별 세부 속성 질문:
+   - 의류: 종류 + 색상 + 사이즈 + 스타일 + 계절감 + 용도
+   - 신발: 종류 + 사이즈 + 색상 + 용도 + 굽높이 + 브랜드선호도
+   - 가방: 종류 + 크기 + 색상 + 용도 + 재질 + 가격대
+   - 화장품: 종류 + 피부타입 + 색상 + 브랜드 + 효과 + 가격대
+   - 전자제품: 종류 + 용도 + 사양 + 브랜드 + 크기 + 예산
+
+2. 다중 정보 수집 방식:
+   - "어떤 [카테고리]를 찾으시나요? + 추가로 [색상/크기/용도/스타일] 중에 특별히 원하는 것이 있나요?"
+   - 선택지 6개 + 각 선택지마다 추가 속성 질문 포함
+   - "평소 선호하는 스타일이나 브랜드, 가격대가 있으시면 함께 알려주세요!"
+
+3. 구체적 상황별 질문:
+   - 용도: "언제, 어디서, 누구와 함께 사용하실 건가요?"
+   - 스타일: "캐주얼한 느낌? 정장 스타일? 트렌디한 것?"
+   - 예산: "대략적인 가격대나 예산이 있으시나요?"
+   - 선호도: "평소 좋아하는 브랜드나 피하고 싶은 스타일이 있나요?"
+
+4. 재질문 형식 (풍부한 정보 수집):
+"[메인 질문] + [6개 선택지] + [추가 속성 질문 2-3개]"
+
+예시:
+"어떤 상의를 찾으시나요? 1️⃣👕티셔츠 2️⃣👔셔츠 3️⃣🧥자켓 4️⃣👘블라우스 5️⃣🧶니트 6️⃣🎽탱크탑
+추가로 원하는 색상, 사이즈, 착용 상황(데일리/정장/데이트 등)도 함께 알려주시면 더 정확한 추천을 드릴 수 있어요! 평소 선호하는 브랜드나 가격대가 있다면 그것도 말씀해주세요."
+
+재질문을 생성하세요 (선택지 6개 + 추가 정보 요청 포함):
+"""
+        
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "친근한 쇼핑 도우미로서 구체적이고 도움이 되는 재질문을 생성합니다."},
+                    {"role": "user", "content": clarification_prompt}
+                ],
+                temperature=0.7,
+                max_tokens=200
+            )
+            
+            llm_question = response.choices[0].message.content.strip()
+            print(f"[LLM 재질문] '{llm_question}'")
+            return llm_question
+            
+        except Exception as e:
+            print(f"[LLM 재질문 오류] {e}")
+            # 폴백: 카테고리별 기본 재질문
+            if '상의' in user_query or '옷' in user_query:
+                return "상의 중에서도 어떤 종류를 찾으시나요? 1️⃣👕티셔츠 2️⃣👔셔츠 3️⃣🧥자켓 4️⃣👕블라우스 5️⃣🧶니트 6️⃣👘기타"
+            elif '하의' in user_query:
+                return "하의 중에서도 어떤 종류를 찾으시나요? 1️⃣👖청바지 2️⃣👔슬랙스 3️⃣👗치마 4️⃣🩱레깅스 5️⃣🩳반바지 6️⃣👘기타"
+            else:
+                return "어떤 카테고리를 찾으시나요? 1️⃣👕의류 2️⃣👟신발 3️⃣👜가방 4️⃣💄화장품 5️⃣📱전자제품 6️⃣🎁기타"
+
+
+
+
+    
+    # --- LLM 프롬프트: LLM이 최종 UI 문장까지 생성 (ui_message) ---
     INTENT_GATE_PROMPT = lambda user_query, recent_context: f"""
     다음 사용자 질의를 읽고 '의도 파악 신뢰도'를 평가하세요.
     출력은 반드시 JSON 한 덩어리만. 다른 문장/주석 금지.
@@ -1004,19 +1368,47 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     [이전 대화 요약(있으면 3~5개 줄)]
     {recent_context or '없음'}
 
-    채점 규칙(엄수):
-    - 질의에 '세부 품목명/유형'이 명확히 있으면 direct_match는 최소 0.8 이상.
-    (예: 비빔면, 스니커즈, 로퍼, 전자레인지, 패딩, 여름 원피스 등)
-    - 평균은 가중평균으로 계산(참고값로만 기입해도 됨):
-    avg_score = 0.6*direct_match + 0.2*attribute_match + 0.1*context_match + 0.1*brand_match
-    - 우선 진행 규칙: direct_match ≥ 0.81 이면 avg_score가 0.7 미만이어도 route="proceed".
-    - 그렇지 않으면 avg_score 기준으로 route를 결정:
-    avg_score ≥ 0.7 → "proceed", 그 미만 → "clarify".
+    채점 규칙(디테일한 평가 필수):
+    
+    🎯 direct_match (직접 매칭) - 가중치 60%:
+    - 구체적 품목명(비빔면, 스니커즈, 아이폰15 등): 0.8~1.0
+    - 중간 구체성(상의, 운동화, 스마트폰 등): 0.5~0.7  
+    - 모호한 카테고리(옷, 신발, 전자제품 등): 0.2~0.4
+    - 매우 모호(좋은거, 예쁜거, 필요한거 등): 0.0~0.2
+    
+    🔍 attribute_match (속성 매칭) - 가중치 20%:
+    - 색상/크기/재질/스타일 등 구체적 속성 언급: 0.6~1.0
+    - 용도/목적/상황 등 맥락적 속성: 0.4~0.6
+    - 가격대/브랜드 수준 등 간접 속성: 0.2~0.4
+    - 속성 언급 없음: 0.0~0.2
+    
+    🏷️ brand_match (브랜드 매칭) - 가중치 10%:
+    - 명확한 브랜드명 언급: 0.8~1.0
+    - 브랜드 수준/등급 언급(명품, 고급, 저렴한 등): 0.4~0.6
+    - 브랜드 관련 언급 없음: 0.0~0.2
+    
+    📖 context_match (맥락 매칭) - 가중치 10%:
+    - 이전 대화와 연관성 높음: 0.6~1.0
+    - 이전 대화와 연관성 중간: 0.3~0.6
+    - 이전 대화와 연관성 없음: 0.0~0.3
+    
+    ⚖️ 가중평균: avg = 0.6*direct + 0.2*attribute + 0.1*brand + 0.1*context
 
-    재질문 지침:
-    - 판매 전문가 톤, 한 문장. 불필요한 서론 금지. 단 한글 기준 150자 정도는 자세히 설명. 영어는 200글자로 자세히 설명.
-    - attribute/context/brand 중 최소 1개 축을 올릴 수 있게 설계.
-    - 선택지는 2~3개로 짧게.
+    재질문 지침 (매우 중요 - 카테고리 정확성 필수):
+    🧠 이전 대화 분석 우선:
+    - 이미 언급된 카테고리가 있다면 그 범위 내에서 구체화 질문
+    - 반복적인 모호한 질문이면 다른 접근법으로 재질문  
+    - 이전에 거부된 항목들은 제외하고 선택지 구성
+    - 사용자 질의의 정확한 카테고리를 파악하고 그 카테고리 내에서만 6개 선택지 제시!
+    - 카테고리별 정확한 선택지:
+      * "옷/의류" → 👕상의, 👖하의, 👗원피스, 🧥아우터, 🩲속옷, �모자
+      * "신발" → 👟운동화, 👞구두, 🥿로퍼, �하이힐, 🥾부츠, 👡샌들
+      * "가방" → 🎒백팩, �👜핸드백, 💼서류가방, 👛지갑, 🛍️쇼핑백, 🎁선물가방
+      * "음식" → 🍜면류, 🍚밥류, 🥘반찬, 🍖고기류, 🥗채소류, 🍰디저트
+      * "전자제품" → 📱휴대폰, 💻컴퓨터, 📺TV, 🏠생활가전, 🎮게임기, 📷카메라
+      * "화장품" → 💄립스틱, 🧴스킨케어, 👁️아이메이크업, 💅네일, 🧴헤어케어, 🧼클렌징
+    - 절대 다른 카테고리 섞지 말 것! 예: "옷"이면 신발/가방 포함 금지!
+    - 형식: "어떤 종류를 찾으시나요? 1️⃣옵션1 2️⃣옵션2 3️⃣옵션3 4️⃣옵션4 5️⃣옵션5 6️⃣옵션6"
 
     JSON 스키마:
     {{
@@ -1026,15 +1418,36 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     "brand_match": 0.0,
     "avg_score": 0.0,
     "route": "clarify",
-    "clarify_question": "한 문장 재질문",
+    "clarify_question": "구체적인 선택지 6개를 포함한 재질문",
     "refine_terms": ["보강 키워드 2~3개"],
     "notes": ["근거 1~2개"]
     }}
     """
 
     def run_intent_gate(user_query: str, session_history, client, model=LLM_MODEL):
+        # 🚀 바로검색 명령어 확인 - 재질문 패스
+        if check_direct_search_command(user_query):
+            print(f"[바로검색] 명령어 감지: '{user_query}' → 재질문 패스하고 바로 검색")
+            return {
+                "direct_match": 0.9, "context_match": 0.8,
+                "attribute_match": 0.7, "brand_match": 0.6,
+                "avg_score": 0.85, "route": "proceed",
+                "clarify_question": "",
+                "refine_terms": ["direct_search"],
+                "notes": ["direct_search_command"],
+                "completion_ratio": 1.0,
+                "completion_percent": 100,
+                "completion_message": "🚀 바로검색 모드"
+            }
+        
         # 1) 최근 문맥 안정 구성
         recent_context = _build_recent_context(session_history, k=5)
+        
+        # 🧠 대화 맥락 종합 분석
+        context_analysis = analyze_conversation_context(session_history)
+        print(f"[맥락분석] 주요카테고리={context_analysis['main_category']}, "
+              f"언급속성={context_analysis['mentioned_attributes']}, "
+              f"반복질문={len(context_analysis['repeated_queries'])}")
 
         # 2) 호출 (JSON 강제)
         raw = client.chat.completions.create(
@@ -1045,7 +1458,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             ],
             temperature=0,
             response_format={"type": "json_object"},
-            max_tokens=300
+            max_tokens=400
         ).choices[0].message.content
 
         # 3) 안전 파싱 (+한 번 더 보정 시도)
@@ -1059,7 +1472,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     "direct_match": 0.0, "context_match": 0.0,
                     "attribute_match": 0.0, "brand_match": 0.0,
                     "avg_score": 0.0, "route": "clarify",
-                    "clarify_question": "원하시는 종류·용도·주요 속성 중 하나만 더 알려주실래요?",
+                    "clarify_question": "어떤 카테고리를 찾으시나요? 1️⃣의류 2️⃣신발 3️⃣가방 4️⃣화장품 5️⃣전자제품 6️⃣기타",
                     "refine_terms": [], "notes": ["parse_fail"]
                 }
 
@@ -1067,6 +1480,25 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         avg_score, route = _recompute_route(intent_eval)
         intent_eval["avg_score"] = avg_score
         intent_eval["route"] = route
+
+        # 🎯 완성률 계산 및 추가
+        completion_ratio, completion_percent = calculate_completion_rate(avg_score, THRESHOLD)
+        completion_message = format_completion_message(completion_percent, avg_score, THRESHOLD)
+        
+        # 🧠 종합적 재질문 생성 (맥락 고려) - LLM 활용
+        if route == "clarify":
+            enhanced_question = _generate_llm_clarification(
+                user_query, recent_context, context_analysis, client
+            )
+            intent_eval["clarify_question"] = enhanced_question
+        
+        # Intent 평가 결과에 완성률 정보 추가
+        intent_eval["completion_ratio"] = completion_ratio
+        intent_eval["completion_percent"] = completion_percent
+        intent_eval["completion_message"] = completion_message
+        intent_eval["context_analysis"] = context_analysis
+
+        print(f"[완성률] avg_score={avg_score:.3f} → {completion_message}")
 
         # 5) 디버그(원하면 남기되, recent_context엔 안 넣도록 태그 유지)
         try:
@@ -1080,11 +1512,49 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     intent_eval = run_intent_gate(query, session_history, client, model=LLM_MODEL)
     avg_score = float(intent_eval.get("avg_score", 0.0))
     route = (intent_eval.get("route") or "").lower()
-    print(f"[IntentGate] avg={avg_score:.2f} route={route} "
+    completion_percent = intent_eval.get("completion_percent", 0)
+    print(f"[IntentGate] avg={avg_score:.2f} route={route} 완성률={completion_percent}% "
         f"D={intent_eval.get('direct_match')} C={intent_eval.get('context_match')} "
         f"A={intent_eval.get('attribute_match')} B={intent_eval.get('brand_match')}")
 
     THRESHOLD = 0.70
+
+    # 🔄 재질문 횟수 추적 및 누적 쿼리 관리
+    clarification_count = 0
+    user_query_parts = []
+    
+    # 세션 히스토리에서 재질문 횟수와 사용자 질문들 수집
+    try:
+        for msg in session_history.messages[-15:]:  # 최근 15개 메시지 확인
+            content = getattr(msg, "content", "") or ""
+            
+            # 재질문 횟수 카운트
+            if ("needs_clarification" in content or "어떤 종류를 찾으시나요" in content or 
+                "재질문" in content or "🔄" in content):
+                clarification_count += 1
+                
+            # 사용자 메시지만 수집 (INTENT_GATE 태그 제외)
+            elif (hasattr(msg, 'type') and msg.type == 'human' and 
+                  "[INTENT_GATE]" not in content and content.strip()):
+                clean_content = content.strip().replace("찾아줘", "").replace("찾아", "").replace("을", "").replace("를", "").strip()
+                if clean_content and len(clean_content) < 30:  # 너무 긴 질문 제외
+                    user_query_parts.append(clean_content)
+                    
+    except Exception as e:
+        print(f"[재질문 추적 오류] {e}")
+    
+    # 사용자 질문들을 의미있게 조합 (최신 것을 우선으로)
+    if user_query_parts:
+        # 중복 제거하면서 순서 유지
+        unique_parts = []
+        for part in reversed(user_query_parts[-3:]):  # 최근 3개만
+            if part not in unique_parts:
+                unique_parts.insert(0, part)
+        combined_query = " ".join(unique_parts)
+    else:
+        combined_query = query
+    
+    print(f"[재질문 추적] 횟수={clarification_count}, 사용자질문들={user_query_parts}, 누적쿼리='{combined_query}'")
 
     # clarify 답변 수집
     clarify_answer = None
@@ -1100,17 +1570,50 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     if route == "proceed":
         pass  # 다음 단계 진행
     else:
-        # 평균 점수 미달 + 보강답변 없음 → 재질문
-        if avg_score < THRESHOLD and not clarify_answer:
-            followup = intent_eval.get("clarify_question") or "원하시는 종류·용도·브랜드 중 하나만 더 알려주실래요?"
+        # 🚨 재질문 횟수 제한 (3번 초과 시 강제 진행)
+        if clarification_count >= 3:
+            print(f"[재질문 제한] {clarification_count}번 재질문 완료 → 누적쿼리로 강제 진행: '{combined_query}'")
+            query = combined_query  # 누적된 쿼리로 검색 진행
+            pass  # 검색으로 진행
+            
+        # 평균 점수 미달 + 보강답변 없음 → 재질문 (3번 미만일 때만)
+        elif avg_score < THRESHOLD and not clarify_answer:
+            # 🧠 누적 쿼리로 재평가 (쿼리가 실제로 달라졌을 때만)
+            if combined_query != query and len(user_query_parts) > 1:
+                print(f"[누적 재평가] 기존 쿼리='{query}' → 누적 쿼리='{combined_query}'")
+                # 누적된 쿼리로 다시 intent gate 실행
+                intent_eval_combined = run_intent_gate(combined_query, session_history, client, model=LLM_MODEL)
+                avg_score_combined = float(intent_eval_combined.get("avg_score", 0.0))
+                route_combined = (intent_eval_combined.get("route") or "").lower()
+                
+                if route_combined == "proceed" or avg_score_combined >= THRESHOLD:
+                    print(f"[누적 재평가] 통과! avg={avg_score_combined:.3f} → 검색 진행")
+                    query = combined_query
+                    pass  # 검색으로 진행
+                else:
+                    print(f"[누적 재평가] 여전히 부족 avg={avg_score_combined:.3f} → 재질문")
+                    # 누적 평가 결과를 사용
+                    intent_eval = intent_eval_combined
+            
+            # 재질문 생성
+            followup = intent_eval.get("clarify_question") or "어떤 카테고리를 찾으시나요? 1️⃣의류 2️⃣신발 3️⃣가방 4️⃣화장품 5️⃣전자제품 6️⃣기타"
+            completion_message = intent_eval.get("completion_message", f"💡 질문 완성률: {intent_eval.get('completion_percent', 0)}%")
+            
+            # 재질문 횟수 정보 추가
+            enhanced_followup = f"{followup}\n\n{completion_message}"
+            
             return {
-                "query": query,
-                "UserMessage": followup,
+                "query": combined_query,  # 누적 쿼리로 저장
+                "UserMessage": enhanced_followup,
                 "RawContext": [m.content for m in session_history.messages],
                 "results": [],
-                "combined_message_text": followup,
+                "combined_message_text": enhanced_followup,
                 "intent_gate": intent_eval,
-                "needs_clarification": True
+                "needs_clarification": True,
+                "completion_percent": intent_eval.get("completion_percent", 0),
+                "completion_message": completion_message,
+                "clarification_count": clarification_count + 1,
+                "accumulated_query": combined_query
             }
 
         # 보강답변이 있으면 재평가
@@ -1127,23 +1630,78 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 f"D={intent_eval.get('direct_match')} C={intent_eval.get('context_match')} "
                 f"A={intent_eval.get('attribute_match')} B={intent_eval.get('brand_match')}")
             if route != "proceed" and avg_score < THRESHOLD:
+                # 🎯 완성률 정보 포함된 재질문 생성
                 followup = intent_eval.get("clarify_question") or "조금만 더 구체화해주실래요? (용도/예산/브랜드 중 하나)"
+                completion_message = intent_eval.get("completion_message", f"💡 질문 완성률: {intent_eval.get('completion_percent', 0)}%")
+                
+                # 재질문에 완성률 정보 추가
+                enhanced_followup = f"{followup}\n\n{completion_message}"
+                
                 return {
                     "query": query,
-                    "UserMessage": followup,
+                    "UserMessage": enhanced_followup,
                     "RawContext": [m.content for m in session_history.messages],
                     "results": [],
-                    "combined_message_text": followup,
+                    "combined_message_text": enhanced_followup,
                     "intent_gate": intent_eval,
-                    "needs_clarification": True
+                    "needs_clarification": True,
+                    "completion_percent": intent_eval.get("completion_percent", 0),
+                    "completion_message": completion_message
                 }
 
+    # # clarify 답변 수집
+    # clarify_answer = None
+    # try:
+    #     if isinstance(request, dict):
+    #         clarify_answer = request.get("clarify_answer")
+    #     else:
+    #         clarify_answer = getattr(request, "clarify_answer", None)
+    # except Exception:
+    #     clarify_answer = None
+
+    # # 재질문 횟수 체크
+    # clarify_count = 0
+    # try:
+    #     for msg in session_history.messages[-10:]:
+    #         if hasattr(msg, 'content') and ('[CLARIFY_REQ]' in str(msg.content) or 'needs_clarification' in str(msg.content)):
+    #             clarify_count += 1
+    # except Exception:
+    #     pass
+    # print(f"[재질문횟수] {clarify_count}회 - {'무한루프방지' if clarify_count >= 3 else '정상'}")
+
+    # # 라우팅
+    # if route != "proceed":
+    #     if clarify_count >= 3:
+    #         print(f"[강제통과] 재질문 {clarify_count}회 초과 → 검색 진행")
+    #     elif avg_score < THRESHOLD and not clarify_answer:
+    #         indifferent_patterns = ['상관없', '무관', '아무거나', '어떤거든', '상관 없', '괜찮', '다 좋', '전부','바로검색' ,'바로 검색','즉시검색','그냥검색','바로 찾아','즉시 찾아','그냥 찾아']
+    #         is_indifferent = any(pattern in query.lower() for pattern in indifferent_patterns)
+    #         if is_indifferent:
+    #             print(f"[상관없음감지] '{query}' → 검색 진행")
+    #         else:
+    #             return create_clarify_response(intent_eval, query, session_history, completion_percent, target_lang)
+
+    #     if clarify_answer:
+    #         query = f"{query} {clarify_answer}".strip()
+    #         try:
+    #             session_history.add_user_message(f"[clarify] {clarify_answer}")
+    #         except Exception:
+    #             pass
+
+    #         intent_eval = run_intent_gate(query, session_history, client, target_lang=target_lang, model=LLM_MODEL)
+    #         avg_score = float(intent_eval.get("avg_score", 0.0))
+    #         route = (intent_eval.get("route") or "").lower()
+    #         print(f"[IntentGate-RE] route={route} avg={avg_score:.2f}")
+
+    #         completion_ratio, completion_percent = calculate_completion(avg_score)
+    #         intent_eval["completion_ratio"] = completion_ratio
+    #         intent_eval["completion_percent"] = completion_percent
+
+    #         if route != "proceed" and avg_score < THRESHOLD:
+    #             return create_clarify_response(intent_eval, query, session_history, completion_percent, target_lang)
+
     # ===== 여기까지 내려오면 통과 → 아래 전처리/카테고리/임베딩 검색 계속 =====
-
     # ===== 통과 시 아래 원래 system_prompt 로직 계속 진행    재질문 END =====
-
-
-
 
 
 
@@ -1211,9 +1769,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 6) **부정/제외 표현(제외/빼고/말고/without 등) 금지.** 결과 문장은 제외 대상 자체를 언급하지 말 것.
 
                 **올바른 예시:**
-                - "여름용 작은 가방" → "여름용 작은 가방입니다"
+                - "여름용 작은 가방" → "여름용 작은 가방을 찾고 있습니다"
                 - "운동할 때 신는 신발" → "운동용 신는 신발을 찾고 있습니다"  
-                - "겨울 따뜻한 외투" → "겨울철 따뜻한 외투입니다"
+                - "겨울 따뜻한 외투" → "겨울철 따뜻한 외투을 찾고 있습니다."
                 
                 **잘못된 예시 (키워드 나열):**
                 - "여름 작은 가방 쿨 소재 여성" (X)
@@ -1233,15 +1791,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     # 🔥 맥락 반영 강제 사용자 메시지 구성
     user_message = f"""
-🚨 현재 사용자 입력: "{query}"
+        🚨 현재 사용자 입력: "{query}"
 
-**필수 실행 단계:**
-1. 위 이전 대화 이력에서 상품명/조건 추출
-2. 현재 입력과 이전 맥락을 강제로 결합
-3. 결합된 검색어로 전처리 수행
+        **필수 실행 단계:**
+        1. 위 이전 대화 이력에서 상품명/조건 추출
+        2. 현재 입력과 이전 맥락을 강제로 결합
+        3. 결합된 검색어로 전처리 수행
 
-반드시 이전 맥락을 반영한 검색어를 생성하세요!
-"""
+        반드시 이전 맥락을 반영한 검색어를 생성하세요!
+        """
 
     resp = client.chat.completions.create(
         model=LLM_MODEL,
@@ -1336,7 +1894,17 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     terms = extract_preprocessed(llm_response, query)
     preprocessed_query = strip_minus_terms(terms)
     
-    # 🔥 맥락 반영 검증
+    # LLM 전처리된 결과에서 가격 조건 재추출 (SIZE_CONDITION은 무시)
+    temp_price = extract_price_condition(preprocessed_query)
+    if temp_price and not temp_price.startswith("SIZE_CONDITION_"):
+        price_cond = temp_price
+        print(f"[Debug] 유효한 가격 조건 재추출: {price_cond}")
+    elif temp_price and temp_price.startswith("SIZE_CONDITION_"):
+        print(f"[Debug] 크기 조건 감지됨, 기존 가격 조건 유지: {price_cond if price_cond else '제한 없음'}")
+    else:
+        print(f"[Debug] LLM 전처리된 쿼리에서 가격 조건 없음, 기존 조건 유지: {price_cond if price_cond else '제한 없음'}")
+    
+    # �🔥 맥락 반영 검증
     print(f"[맥락반영검증] 원본 입력: '{query}'")
     print(f"[맥락반영검증] LLM 처리 결과: '{preprocessed_query}'")
     print(f"[맥락반영검증] 맥락 반영 여부: {'✅ 반영됨' if query != preprocessed_query else '❌ 미반영'}")
@@ -1352,7 +1920,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     
 
-    # ================== LLM 카테고리 힌트 → 카테고리 임베딩 Top3 매칭(방어형) ==================
+    # ================== LLM 카테고리 힌트 → 카테고리 임베딩 Top3 매칭 ==================
     try:
         cat_col
     except NameError:
@@ -1540,9 +2108,36 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # 검색 조건 구성
     search_conditions = []
 
-    # 가격 조건 추가
-    if price_cond:
+    # 가격/크기 조건 처리
+    if price_cond and not price_cond.startswith("SIZE_CONDITION_"):
         search_conditions.append(price_cond)
+        print(f"[Debug] Milvus 검색에 가격 조건 적용: {price_cond}")
+    elif price_cond and price_cond.startswith("SIZE_CONDITION_"):
+        # SIZE_CONDITION을 실제 검색 가능한 조건으로 변환
+        # SIZE_CONDITION_인치_>=_30.0 → title LIKE '%30인치%' (제목에서 크기 검색)
+        try:
+            parts = price_cond.split("_")
+            if len(parts) >= 4:
+                unit = parts[2]  # "인치"
+                operator = parts[3]  # ">="
+                value = parts[4]  # "30.0"
+                
+                # 크기 조건 처리 (이하/이상 조건은 복잡하므로 일단 무시)
+                if unit == "인치":
+                    size_value = int(float(value))
+                    if operator in ["==", "="]:
+                        # 정확한 크기만 검색 가능
+                        size_condition = f"market_product_name LIKE '%{size_value}인치%'"
+                        search_conditions.append(size_condition)
+                        print(f"[Debug] 정확한 크기 조건 적용: {size_condition}")
+                    else:
+                        # 이하/이상/초과/미만 조건은 현재 지원 안함
+                        print(f"[Debug] 크기 범위 조건 '{operator} {size_value}인치'는 현재 지원하지 않음 - 무시")
+                else:
+                    print(f"[Debug] 지원하지 않는 크기 단위: {unit}")
+        except Exception as e:
+            print(f"[Debug] SIZE_CONDITION 파싱 오류: {e}")
+            print(f"[Debug] SIZE_CONDITION 무시: {price_cond}")
 
     # 카테고리 제외 조건 추가 (Milvus 호환 문법 사용)
     if excluded_categories:
@@ -1742,9 +2337,31 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             # 1. 카테고리 조건 (정확 매칭)
             search_conditions.append(f"category_name == '{category}'")
             
-            # 2. 가격 조건
-            if price_cond:
+            # 2. 가격/크기 조건 처리
+            if price_cond and not price_cond.startswith("SIZE_CONDITION_"):
                 search_conditions.append(price_cond)
+                print(f"[Debug] 카테고리별 검색에 가격 조건 적용: {price_cond}")
+            elif price_cond and price_cond.startswith("SIZE_CONDITION_"):
+                # SIZE_CONDITION을 제목 검색 조건으로 변환
+                try:
+                    parts = price_cond.split("_")
+                    if len(parts) >= 4:
+                        unit = parts[2]  # "인치"
+                        operator = parts[3]  # "<=", ">=", 등
+                        value = parts[4]  # "30.0"
+                        
+                        if unit == "인치":
+                            size_value = int(float(value))
+                            if operator in ["==", "="]:
+                                # 정확한 크기만 검색 가능
+                                size_condition = f"market_product_name LIKE '%{size_value}인치%'"
+                                search_conditions.append(size_condition)
+                                print(f"[Debug] 카테고리별 정확한 크기 조건 적용: {size_condition}")
+                            else:
+                                # 이하/이상 조건은 현재 지원 안함
+                                print(f"[Debug] 카테고리별 크기 범위 조건 '{operator} {size_value}인치'는 지원하지 않음 - 무시")
+                except Exception as e:
+                    print(f"[Debug] 카테고리별 SIZE_CONDITION 파싱 오류: {e}")
 
             # 최종 검색 조건 생성
             final_expr = " && ".join(f"({cond})" for cond in search_conditions)
@@ -1972,8 +2589,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - 구성/형태: 세트/단품, 접이식, 휴대용, 벽걸이, 2+1 구성 등
     - 호환/범용/시즌: 정품/호환, 규격·사이즈, 여름/겨울 등
     2) 그 특징을 활용해 고객 의도 확인과 선호 파악을 위한 '확인형 질문'을 반드시! 
-    - 예시 어조: "후보를 보니 [특징A/특징B/특징C] 옵션이 보이는데, 이런 조건이 필요하신가요?"
-    - 가격대(프리미엄/일반/실속), 디자인, 용도, 재질, 브랜드 선호, 계절감, 옵션 유무를 과도한 나열 없이 자연스럽게 묻으세요.
+
+
+
+
+
+
+
+
+
     3) 상품 코드나 구체 모델명/스펙 나열은 금지합니다. 후보에서 추출한 '특징 키워드'만 요약해 언급하세요.
     4) 친근하면서도 전문적인 대화체를 유지하세요.
     5) 아래 예시는 참고만 하며, 그대로 복사하지 말고 실제 후보의 특징으로 대체하세요.
@@ -1987,6 +2611,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     """
 
     print("target_lang->", target_lang)
+    # - 예시 어조: "후보를 보니 [특징A/특징B/특징C] 옵션이 보이는데, 이런 조건이 필요하신가요?"
+    # - 가격대(프리미엄/일반/실속), 디자인, 용도, 재질, 브랜드 선호, 계절감, 옵션 유무를 과도한 나열 없이 자연스럽게 묻으세요.
 
     # 2) 호출부 동일 (system에 실어 보내는 현재 구조 유지)
     response = client.chat.completions.create(
@@ -2169,7 +2795,7 @@ async def popular_products(days: int = 7, limit: int = 20):
 class DebugRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
-    clarify_answer: Optional[str] = None   # ← 추가: 재질문 답변(있으면 2턴째로 처리)
+    clarify_answer: Optional[str] = None 
 
 @app.post('/debug-search')
 async def debug_search(data: DebugRequest, request: Request):
