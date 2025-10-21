@@ -8,6 +8,7 @@ import json
 import base64
 import urllib
 from concurrent.futures import ThreadPoolExecutor
+import redis
 
 from langdetect import detect
 from collections import defaultdict, Counter
@@ -18,7 +19,6 @@ try:
     from langchain_community.cross_encoders import HuggingFaceCrossEncoder
     LANGCHAIN_AVAILABLE = True
 except ImportError:
-    print("[WARNING] langchain not available - some features may be disabled")
     LANGCHAIN_AVAILABLE = False
 
 import time
@@ -49,7 +49,6 @@ from langchain_community.chat_message_histories import (
 from langchain_core.chat_history import BaseChatMessageHistory
 import re, unicodedata, difflib
 from typing import Optional, Union, List, Dict, Any, Tuple, Iterable
-from langchain.docstore.document import Document
 
 #가격인식 임포트
 from decimal import Decimal, InvalidOperation
@@ -100,6 +99,15 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE_SECONDS", "10800")) # 3시간
 ADMIN_COOKIE_NAME = os.getenv("ADMIN_COOKIE_NAME", "admin_session")
+
+
+# 🆕 세션 자동 만료 설정
+SESSION_TIMEOUT_MINUTES = 2 # 2분 후 자동 초기화시간 (테스트용)
+SESSION_WARNING_MINUTES = 1  # 1분 후 경고 메시지
+
+TIMEOUT_SECONDS = int(SESSION_TIMEOUT_MINUTES * 60)  # 정수로 변환
+WARNING_SECONDS = SESSION_WARNING_MINUTES * 60  # 경고를 쓸 경우
+
 
 # 1) Milvus 서버에 먼저 연결
 connections.connect(
@@ -469,11 +477,78 @@ class Ranker_DirectSearch:
 
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:
     # 🔧 재질문 임계값 통일 설정
-    THRESHOLD = 0.90             # 평균 점수 임계값 (이상이면 검색 진행)
-    DIRECT_MATCH_HIGH = 0.8      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
-    FACET_COVERAGE_MIN = 0.35     # 최소 속성 커버리지 (미달 시 재질문)
-    ATTRIBUTE_MIN = 0.40          # 속성 매칭 최소값
-    FACET_SUFFICIENT = 0.50       # 충분한 속성 커버리지
+    THRESHOLD = 0.7             # 평균 점수 임계값 (이상이면 검색 진행)
+    DIRECT_MATCH_HIGH = 0.65      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
+    FACET_COVERAGE_MIN = 0.2     # 최소 속성 커버리지 (미달 시 재질문)
+    ATTRIBUTE_MIN = 0.3          # 속성 매칭 최소값
+    FACET_SUFFICIENT = 0.35       # 충분한 속성 커버리지
+
+
+    def check_session_timeout(session_history, session_id: str) -> dict:
+        """
+        세션의 마지막 활동 시간을 체크하여 자동 만료 처리
+        """
+        try:
+            r = redis.from_url(REDIS_URL)
+            session_key = f"message_store:{session_id}"
+            ttl = r.ttl(session_key)  # 초 단위
+            print(f"[세션체크] 세션 {session_id} TTL={ttl}초 (기준={TIMEOUT_SECONDS}초={SESSION_TIMEOUT_MINUTES}분)")
+            
+
+            # TTL이 0 이하 → 만료 처리 (TTL 연장 전에 체크)
+            if ttl <= 0:
+                print(f"[세션만료 감지] TTL={ttl}초, 세션 {session_id} 자동 초기화 시작")
+                
+                # 1. 기존 세션 데이터 완전 삭제
+                clear_message_history(session_id)
+                
+                # 2. 초기화 메시지 생성
+                msg = (f"💫 마지막 대화가 {SESSION_TIMEOUT_MINUTES}분 동안 없어 자동으로 초기화되었습니다.\n\n새로운 상품 검색을 시작해보세요! 😊")
+
+                # 3. 새로운 세션에 초기화 메시지 저장
+                try:
+                    new_session_history = RedisChatMessageHistory(session_id=session_id, url=REDIS_URL)
+                    new_session_history.add_ai_message(msg)
+                    # 새 세션 TTL 설정
+                    r.expire(session_key, TIMEOUT_SECONDS)
+                    print(f"[세션만료] 새 세션 생성 및 초기화 메시지 저장 완료")
+                except Exception as e:
+                    print(f"[세션만료 안내 기록 오류] {e}")
+
+                print(f"[세션만료] 응답 반환: session_expired=True")
+                return {
+                    "query": "auto_reset",
+                    "assistant_message": msg,
+                    "UserMessage": msg,
+                    "RawContext": [],
+                    "results": [],
+                    "combined_message_text": msg,
+                    "needs_clarification": False,
+                    "auto_reset": True,
+                    "session_expired": True
+                }
+
+            # 만료되지 않았으면 TTL 연장
+            if ttl == -2:  # 새 세션
+                print(f"[세션체크] 새 세션 - TTL 설정")
+                r.expire(session_key, TIMEOUT_SECONDS)
+                return None
+            elif ttl == -1:  # TTL 미설정
+                print(f"[세션체크] TTL 미설정 - TTL 설정")
+                r.expire(session_key, TIMEOUT_SECONDS)
+                return None
+            else:  # 정상 세션
+                print(f"[세션체크] 정상 세션 - TTL 연장")
+                r.expire(session_key, TIMEOUT_SECONDS)
+                return None
+
+        except Exception as e:
+            print(f"[세션체크 오류] {e}")
+            return None
+
+
+
+    
 
     def calculate_completion_rate(avg_score: float, threshold: float = THRESHOLD) -> tuple:
         """
@@ -515,17 +590,17 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             str: 완성률 메시지
         """
         if completion_percent >= 100:
-            return f"💯 질문 완성률: {completion_percent}% (검색 실행!)"
+            return f"💯{completion_percent}%"
         elif completion_percent >= 80:
-            return f"🎯 질문 완성률: {completion_percent}% (거의 완성)"
+            return f"🎯{completion_percent}%"
         elif completion_percent >= 60:
-            return f"📈 질문 완성률: {completion_percent}% (조금 더 구체적으로)"
+            return f"📈{completion_percent}%"
         elif completion_percent >= 40:
-            return f"📊 질문 완성률: {completion_percent}% (더 자세히 알려주세요)"
+            return f"📊{completion_percent}%"
         elif completion_percent >= 20:
-            return f"📉 질문 완성률: {completion_percent}% (많이 부족해요)"
+            return f"📉{completion_percent}%"
         else:
-            return f"❓ 질문 완성률: {completion_percent}% (처음부터 다시)"
+            return f"❓{completion_percent}%"
     
     collection = Collection(COLLECTION)   #다시 상품 DB 컬렉션으로 연결
     def convert_to_serializable(obj):
@@ -596,7 +671,30 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     # ✅ Redis 세션 기록 불러오기 및 최신 입력 저장
     session_history = get_session_history(session_id)
+
+    # 🕒 세션 자동 만료 체크 (경고 없이 바로 처리)
+    timeout_result = check_session_timeout(session_history, session_id)
+    print(f"[세션체크] timeout_result={timeout_result}")
+    if timeout_result and timeout_result.get("session_expired"):
+        # 세션이 만료된 경우 자동 초기화 메시지를 즉시 반환 (이미 Redis에 저장됨)
+        print(f"[세션만료] 자동 초기화 메시지 반환: {timeout_result['assistant_message'][:50]}...")
+        return timeout_result
+
+
+
+
+
     session_history.add_user_message(query)
+
+    # 🔁 마지막 활동 기준으로 TTL 갱신(슬라이딩)
+    try:
+        r = redis.from_url(REDIS_URL)
+        r.expire(f"message_store:{session_id}", TIMEOUT_SECONDS)  # 활동할 때마다 연장
+    except Exception as e:
+        print(f"[세션 TTL 갱신 오류] {e}")
+
+
+
 
     previous_queries = [msg.content for msg in session_history.messages if isinstance(msg, HumanMessage)]
     if query in previous_queries:
@@ -1007,7 +1105,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         if neg_hit: adj += NEG_PENALTY
         return adj
 
-    def ㅊseason_filter_items(items: list, season_hint: str):
+    def season_filter_items(items: list, season_hint: str):
         """시즌에 맞는 상품만 필터링하여 반환"""
         if not season_hint or season_hint == "미정" or not items:
             return items
@@ -1053,6 +1151,23 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # 대화 이력 가져오기
     history_messages = [msg.content for msg in session_history.messages]
     conversation_context = "\n".join([f"이전 대화: {msg}" for msg in history_messages[-10:]]) if history_messages else "이전 대화 없음"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     # ===== 사용자 의도 파악  LLM 재질문 Start =====
@@ -1177,7 +1292,22 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             '바로검색', '바로 검색', '즉시검색', '즉시 검색',
             '그냥검색', '그냥 검색', '바로찾아', '바로 찾아',
             '즉시찾아', '즉시 찾아', '그냥찾아', '그냥 찾아',
-            '바로해', '바로 해'
+            '바로해', '바로 해',
+
+                # 영어 패턴
+            'direct search', 'immediate search', 'instant search',
+            'quick search', 'fast search', 'just search',
+            'search now', 'find now', 'direct find',
+            'immediate find', 'instant find', 'quick find',
+            'fast find', 'just find', 'search directly',
+            'find directly', 'search immediately', 'find immediately',
+            'go search', 'go find', 'do search', 'do find',
+            
+            # 축약형/간단한 명령어
+            'direct', 'immediate', 'instant', 'now',
+            'go', 'just do it', 'skip', 'proceed'
+
+
         ]
         
         query_lower = user_query.lower().replace(' ', '')
@@ -1245,170 +1375,113 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             
         return context_info
 
-    def _generate_contextual_clarification(base_question: str, context_analysis: Dict, user_query: str) -> str:
-        """
-        대화 맥락을 고려한 종합적인 재질문 생성
-        """
-        # 구체적인 상위-하위 관계 감지
-        if '옷' in user_query and ('상의' in user_query or '하의' in user_query or '원피스' in user_query):
-            if '상의' in user_query:
-                return "상의 중에서도 어떤 종류를 원하시나요? 1️⃣티셔츠 2️⃣셔츠 3️⃣블라우스 4️⃣니트 5️⃣후드티 6️⃣조끼"
-            elif '하의' in user_query:
-                return "하의 중에서도 어떤 종류를 원하시나요? 1️⃣청바지 2️⃣슬랙스 3️⃣치마 4️⃣레깅스 5️⃣반바지 6️⃣운동복"
-            elif '원피스' in user_query:
-                return "원피스 중에서도 어떤 스타일을 원하시나요? 1️⃣캐주얼 2️⃣정장 3️⃣파티 4️⃣원피스 5️⃣맥시 6️⃣미니"
-                
-        # 반복 질문 감지
-        if len(context_analysis['repeated_queries']) > 0:
-            if context_analysis['main_category']:
-                return f"'{context_analysis['main_category']}' 관련해서 좀 더 구체적으로 어떤 속성(색상, 크기, 용도, 스타일)을 원하시나요? 🤔"
-            else:
-                return "계속 비슷한 질문을 하고 계시네요. 다른 방식으로 설명해주시거나, 용도나 상황을 알려주세요! 💡"
-        
-        # 이미 카테고리가 확정된 경우
-        if context_analysis['main_category']:
-            category = context_analysis['main_category']
-            if '옷' in category or '의류' in category:
-                return "어떤 종류 의류를 찾으시나요? 1️⃣👕상의 2️⃣👖하의 3️⃣👗원피스 4️⃣🧥아우터 5️⃣🩲속옷 6️⃣🧢모자"
-            elif '신발' in category:
-                return "어떤 종류 신발을 찾으시나요? 1️⃣👟운동화 2️⃣👞구두 3️⃣🥿로퍼 4️⃣👠하이힐 5️⃣🥾부츠 6️⃣👡샌들"
-            elif '가방' in category:
-                return "어떤 종류 가방을 찾으시나요? 1️⃣🎒백팩 2️⃣👜핸드백 3️⃣💼서류가방 4️⃣👛지갑 5️⃣🛍️쇼핑백 6️⃣🎁선물가방"
-        
-        # 속성이 이미 언급된 경우
-        if context_analysis['mentioned_attributes']:
-            mentioned = ', '.join(context_analysis['mentioned_attributes'][:3])
-            return f"이미 {mentioned} 관련 정보를 주셨네요. 구체적인 상품명이나 브랜드를 알려주시면 더 정확히 찾을 수 있어요! 🎯"
-        
-        # 기본 재질문 사용
-        return base_question or "어떤 카테고리를 찾으시나요? 1️⃣의류 2️⃣신발 3️⃣가방 4️⃣화장품 5️⃣전자제품 6️⃣기타"
-
-    def _generate_llm_clarification(user_query: str, recent_context: str, context_analysis: Dict, client) -> str:
-        """
-        LLM을 활용한 동적 재질문 생성
-        """
-        main_category = context_analysis.get('main_category', '')
-        mentioned_attrs = context_analysis.get('mentioned_attributes', [])
-        
-        clarification_prompt = f"""
-사용자가 "{user_query}"라고 질문했습니다. 
-이전 대화: {recent_context or '없음'}
-주요 카테고리: {main_category or '불명확'}
-언급된 속성: {mentioned_attrs or '없음'}
-
-사용자가 정확히 원하는 상품을 찾기 위해 매우 구체적이고 자세한 정보를 수집하는 재질문을 생성해주세요.
-
-🎯 재질문 전략 (다층적 정보 수집):
-
-1. 카테고리별 세부 속성 질문:
-   - 의류: 종류 + 색상 + 사이즈 + 스타일 + 계절감 + 용도
-   - 신발: 종류 + 사이즈 + 색상 + 용도 + 굽높이 + 브랜드선호도
-   - 가방: 종류 + 크기 + 색상 + 용도 + 재질 + 가격대
-   - 화장품: 종류 + 피부타입 + 색상 + 브랜드 + 효과 + 가격대
-   - 전자제품: 종류 + 용도 + 사양 + 브랜드 + 크기 + 예산
-
-2. 다중 정보 수집 방식:
-   - "어떤 [카테고리]를 찾으시나요? + 추가로 [색상/크기/용도/스타일] 중에 특별히 원하는 것이 있나요?"
-   - 선택지 6개 + 각 선택지마다 추가 속성 질문 포함
-   - "평소 선호하는 스타일이나 브랜드, 가격대가 있으시면 함께 알려주세요!"
-
-3. 구체적 상황별 질문:
-   - 용도: "언제, 어디서, 누구와 함께 사용하실 건가요?"
-   - 스타일: "캐주얼한 느낌? 정장 스타일? 트렌디한 것?"
-   - 예산: "대략적인 가격대나 예산이 있으시나요?"
-   - 선호도: "평소 좋아하는 브랜드나 피하고 싶은 스타일이 있나요?"
-
-4. 재질문 형식 (풍부한 정보 수집):
-"[메인 질문] + [6개 선택지] + [추가 속성 질문 2-3개]"
-
-예시:
-"어떤 상의를 찾으시나요? 1️⃣👕티셔츠 2️⃣👔셔츠 3️⃣🧥자켓 4️⃣👘블라우스 5️⃣🧶니트 6️⃣🎽탱크탑
-추가로 원하는 색상, 사이즈, 착용 상황(데일리/정장/데이트 등)도 함께 알려주시면 더 정확한 추천을 드릴 수 있어요! 평소 선호하는 브랜드나 가격대가 있다면 그것도 말씀해주세요."
-
-재질문을 생성하세요 (선택지 6개 + 추가 정보 요청 포함):
-"""
-        
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "친근한 쇼핑 도우미로서 구체적이고 도움이 되는 재질문을 생성합니다."},
-                    {"role": "user", "content": clarification_prompt}
-                ],
-                temperature=0.7,
-                max_tokens=200
-            )
-            
-            llm_question = response.choices[0].message.content.strip()
-            print(f"[LLM 재질문] '{llm_question}'")
-            return llm_question
-            
-        except Exception as e:
-            print(f"[LLM 재질문 오류] {e}")
-            # 폴백: 카테고리별 기본 재질문
-            if '상의' in user_query or '옷' in user_query:
-                return "상의 중에서도 어떤 종류를 찾으시나요? 1️⃣👕티셔츠 2️⃣👔셔츠 3️⃣🧥자켓 4️⃣👕블라우스 5️⃣🧶니트 6️⃣👘기타"
-            elif '하의' in user_query:
-                return "하의 중에서도 어떤 종류를 찾으시나요? 1️⃣👖청바지 2️⃣👔슬랙스 3️⃣👗치마 4️⃣🩱레깅스 5️⃣🩳반바지 6️⃣👘기타"
-            else:
-                return "어떤 카테고리를 찾으시나요? 1️⃣👕의류 2️⃣👟신발 3️⃣👜가방 4️⃣💄화장품 5️⃣📱전자제품 6️⃣🎁기타"
-
-
-
 
     
-    # --- LLM 프롬프트: LLM이 최종 UI 문장까지 생성 (ui_message) ---
+    # --- LLM 프롬프트: 의도 파악 + 스마트 재질문 통합 (ui_message) ---
     INTENT_GATE_PROMPT = lambda user_query, recent_context: f"""
-    다음 사용자 질의를 읽고 '의도 파악 신뢰도'를 평가하세요.
+    **AI 통합 분석 & 재질문 시스템**
+    다음 사용자 질의를 읽고 '의도 파악 신뢰도'를 평가하고 맞춤 재질문을 생성하세요.
     출력은 반드시 JSON 한 덩어리만. 다른 문장/주석 금지.
 
-    [사용자 질의]
-    {user_query}
+    [사용자 질의] {user_query}
+    [이전 대화 요약] {recent_context or '없음'}
 
-    [이전 대화 요약(있으면 3~5개 줄)]
-    {recent_context or '없음'}
+    ⚡ **0단계: 엄격한 자동 진행 규칙 (Strict Auto-Proceed)**
+    다음에 **정확히** 해당하는 경우만 재질문 없이 바로 진행하세요.
 
-    채점 규칙(디테일한 평가 필수):
-    
-    🎯 direct_match (직접 매칭) - 가중치 60%:
-    - 구체적 품목명(비빔면, 스니커즈, 아이폰15 등): 0.8~1.0
-    - 중간 구체성(상의, 운동화, 스마트폰 등): 0.5~0.7  
-    - 모호한 카테고리(옷, 신발, 전자제품 등): 0.2~0.4
-    - 매우 모호(좋은거, 예쁜거, 필요한거 등): 0.0~0.2
-    
-    🔍 attribute_match (속성 매칭) - 가중치 20%:
-    - 색상/크기/재질/스타일 등 구체적 속성 언급: 0.6~1.0
-    - 용도/목적/상황 등 맥락적 속성: 0.4~0.6
-    - 가격대/브랜드 수준 등 간접 속성: 0.2~0.4
-    - 속성 언급 없음: 0.0~0.2
-    
-    🏷️ brand_match (브랜드 매칭) - 가중치 10%:
-    - 명확한 브랜드명 언급: 0.8~1.0
-    - 브랜드 수준/등급 언급(명품, 고급, 저렴한 등): 0.4~0.6
-    - 브랜드 관련 언급 없음: 0.0~0.2
-    
-    📖 context_match (맥락 매칭) - 가중치 10%:
-    - 이전 대화와 연관성 높음: 0.6~1.0
-    - 이전 대화와 연관성 중간: 0.3~0.6
-    - 이전 대화와 연관성 없음: 0.0~0.3
-    
-    ⚖️ 가중평균: avg = 0.6*direct + 0.2*attribute + 0.1*brand + 0.1*context
+    **🎯 절대 확실한 경우만 자동 진행:**
+    1. **완전한 브랜드+모델명**: "아이폰 15 프로", "갤럭시 S24", "RTX 4070"
+    2. **구체적 규격+제품**: "30인치 모니터", "256GB SSD", "1TB 외장하드"
+    3. **명확한 단일 상품 + 구매 의사**: "에어팟 구매", "맥북 최저가", "아이패드 찾아줘"
 
-    재질문 지침 (매우 중요 - 카테고리 정확성 필수):
-    🧠 이전 대화 분석 우선:
-    - 이미 언급된 카테고리가 있다면 그 범위 내에서 구체화 질문
-    - 반복적인 모호한 질문이면 다른 접근법으로 재질문  
-    - 이전에 거부된 항목들은 제외하고 선택지 구성
-    - 사용자 질의의 정확한 카테고리를 파악하고 그 카테고리 내에서만 6개 선택지 제시!
-    - 카테고리별 정확한 선택지:
-      * "옷/의류" → 👕상의, 👖하의, 👗원피스, 🧥아우터, 🩲속옷, �모자
-      * "신발" → 👟운동화, 👞구두, 🥿로퍼, �하이힐, 🥾부츠, 👡샌들
-      * "가방" → 🎒백팩, �👜핸드백, 💼서류가방, 👛지갑, 🛍️쇼핑백, 🎁선물가방
-      * "음식" → 🍜면류, 🍚밥류, 🥘반찬, 🍖고기류, 🥗채소류, 🍰디저트
-      * "전자제품" → 📱휴대폰, 💻컴퓨터, 📺TV, 🏠생활가전, 🎮게임기, 📷카메라
-      * "화장품" → 💄립스틱, 🧴스킨케어, 👁️아이메이크업, 💅네일, 🧴헤어케어, 🧼클렌징
-    - 절대 다른 카테고리 섞지 말 것! 예: "옷"이면 신발/가방 포함 금지!
-    - 형식: "어떤 종류를 찾으시나요? 1️⃣옵션1 2️⃣옵션2 3️⃣옵션3 4️⃣옵션4 5️⃣옵션5 6️⃣옵션6"
+    **🚨 재질문이 필요한 경우들 (점수 낮게 부여):**
+    - **모호한 카테고리**: "운동용품", "화장품", "전자제품" → direct_match=0.2
+    - **형용사만 있는 경우**: "좋은", "저렴한", "예쁜" → direct_match=0.1
+    - **일반 상품명만**: "가방", "신발", "옷" → direct_match=0.4 (재질문 필요!)
+    - **추상적 요청**: "뭔가", "괜찮은 거", "적당한" → direct_match=0.1
+    - **불완전한 정보**: "겨울용", "여행갈 때" → attribute_match=0.3
+
+    **엄격한 점수 부여 원칙:**
+    - **direct_match**: 정확한 상품명이 아니면 0.5 미만으로 부여
+    - **attribute_match**: 용도/재질/크기/브랜드 중 2개 이상 명시되어야 0.5 이상
+    - **context_match**: 명확한 구매 의사가 있어야 0.6 이상
+    - **총 avg_score ≥ 0.7**: 매우 엄격하게 적용
+
+    🔒 **현재 탐색 카테고리(잠금)**
+    - 질의에서 드러난 1차 카테고리를 잠급니다.
+    - 이 카테고리 **외부로 전환 금지**. 하위 유형/속성 안에서만 질문·선택지를 구성하세요.
+
+    📋 **미션: 핵심 정보만 수집하여 검색 품질 극대화**
+
+    🔍 **1단계: 이미 확정된 정보 파악**
+    이전 대화에서 사용자가 이미 선택하거나 명시한 정보들을 정확히 파악하세요.
+    ⚠️ **절대 금지**: 이미 확정된 정보를 다시 묻는 것!
+
+    🌟 **2단계: 용어/동의어 확장**
+    외국어/브랜드/생소어 존재 시 한국 리테일 검색어로 확장.
+
+    확장 예시:
+    - "프릭남쁠라" → "매운 칠리소스, 태국 핫소스, 스리라차, 고추소스, 매콤한 소스"
+    - "타바스코" → "핫소스, 매운소스, 칠리소스, 고추소스"  
+    - "삼발올렉" → "인도네시아 칠리소스, 매운 디핑소스, 아시아 핫소스"
+    - "우산" → "우산, 양산, 접이식우산, 장우산, 자동우산, 방수우산"
+
+
+    **3단계: 점수 평가**
+    direct_match (60%), attribute_match (20%), brand_match (10%), context_match (10%)
+
+    **특별 점수 처리:**
+    - "우산/모자/가방" 등등 명확한 일상 상품명의 문맥 파악 문장 → direct_match=0.8
+    - "있나?/찾아줘/알려줘" 같은 직접 요청같은 문맥의 문장 → context_match=0.7
+
+    **4단계: 점수상승 지향 재질문 설계**
+    재질문은 아래 4점수를 올리기 위한 목적이어야 함:
+    - direct_match: 구체 명사/규격(타입, 치수, 형태) 확정
+    - attribute_match: 용도/무게/재질/기능/가격대 등 이런 타입 2~3개 선택 유도
+    - brand_match: 브랜드 지정 vs 무관 토글
+    - context_match: 직전/누적쿼리 자세히 요약 후 확인
+
+    **재질문 품질 규칙 - 정보 풍부화 원칙**
+    - **상품별 핵심 정보 제공**: 각 선택지마다 주요 특징, 용도, 가격대, 적합한 상황 등 구매 결정에 필요한 구체적 정보 포함
+    - **비교 기준 명시**: 크기, 재질, 기능, 브랜드, 가격대 등 실제 비교할 수 있는 기준 제시
+    - **사용 시나리오**: 언제, 어디서, 누가 사용하는지에 간결히
+    - **성능/품질 차이**: 고급형 vs 보급형, 전문용 vs 일반용 등의 차이 설명
+    - 한 문단+선택지 이모지 1️⃣~6️⃣ (의미 중복/모호어 금지)
+    - 마지막에 자유기입 한 줄
+
+    **역할 중재(Explain-or-Search, 암묵 추론)**
+    - 문자열 규칙이 아니라 **지배적 의도**로 판단.
+
+    - 지배적 의도가 **설명/정의/차이/의미 질문**(예: "~가 뭐야", "~차이", "~뜻?")이면:
+    1) {target_lang}로 **한 줄 정의(최대 120자)**를 먼저 제시하고,
+
+    2) 즉시 이어서 **짧은 선택지형 브릿지 질문(1️⃣~6️⃣)**로 구매 탐색으로 연결한다.
+
+    3) 이 두 줄을 **clarify_question**에 넣고, 기본적으로 **route="clarify"**로 둔다.
+        (단, 질의 안에 **명시적 구매 의사**와 **구체 항목**이 함께 있으면 route="proceed" 가능)
+
+    4) **expanded_terms**에는 실제 검색에 유용한 3~6개 키워드를 넣는다(동의어/유사 스타일/연관 카테고리).
+    - 지배적 의도가 **구매 탐색**이면: 점수 계산에 따라 proceed/clarify를 선택. clarify일 경우 선택지형 재질문만 제시.
+    - **장문 금지**: 정의 1줄 + 질문 1줄. 모델명/스펙 나열 금지. 검색 친화 키워드만 요약.
+    - 예시(형식 참고용):
+    clarify_question:
+    "페미닌은 부드럽고 우아한 무드로, 레이스·플리츠·플레어와 파스텔 톤이 자주 쓰여요.
+    어떤 아이템으로 볼까요? 1️⃣원피스 2️⃣블라우스 3️⃣스커트 4️⃣가디건 5️⃣액세서리 6️⃣기타(자유입력)"
+
+
+    **정보성 질의에도 적용되는 재질문 가이드(모든 카테고리 공통):**
+    - **고객 혜택 중심**: “이런 점이 편해집니다” 한 줄
+    - **차별화 포인트**: “다른 제품과의 차이” 한 줄
+    - **라이프스타일 매칭**: “이런 분들께 적합” 한 줄
+    - 과장/마켓팅 문구 금지. 구체 키워드만.
+        
+    🌍 **언어 매칭 규칙:**
+    **사용자가 사용한 언어를 감지하고, 그 나라 언어로 답변하세요!!**
+
+    **무조건 어떤 언어가 들어와도 {target_lang}로만 답변하세요!반드시**
+
+    답변 언어는 무조건 {target_lang}로만 작성해주세요. 다른 언어, 혼합 표현 절대 금지.
+    
 
     JSON 스키마:
     {{
@@ -1418,9 +1491,11 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     "brand_match": 0.0,
     "avg_score": 0.0,
     "route": "clarify",
-    "clarify_question": "구체적인 선택지 6개를 포함한 재질문",
-    "refine_terms": ["보강 키워드 2~3개"],
-    "notes": ["근거 1~2개"]
+    "clarify_question": "한 줄 정의 + 한 줄 선택지 질문(또는 순수 선택지 질문)",
+    "expanded_terms": ["검색에 유용한 한국어 키워드 3~6개"],
+    "refine_terms": ["보강 키워드/사이즈확장 결과"],
+    "notes": ["판단 근거(간단히)"]
+
     }}
     """
 
@@ -1458,7 +1533,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             ],
             temperature=0,
             response_format={"type": "json_object"},
-            max_tokens=400
+            max_tokens=600
         ).choices[0].message.content
 
         # 3) 안전 파싱 (+한 번 더 보정 시도)
@@ -1472,7 +1547,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     "direct_match": 0.0, "context_match": 0.0,
                     "attribute_match": 0.0, "brand_match": 0.0,
                     "avg_score": 0.0, "route": "clarify",
-                    "clarify_question": "어떤 카테고리를 찾으시나요? 1️⃣의류 2️⃣신발 3️⃣가방 4️⃣화장품 5️⃣전자제품 6️⃣기타",
+                    "clarify_question": "",
                     "refine_terms": [], "notes": ["parse_fail"]
                 }
 
@@ -1485,26 +1560,30 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         completion_ratio, completion_percent = calculate_completion_rate(avg_score, THRESHOLD)
         completion_message = format_completion_message(completion_percent, avg_score, THRESHOLD)
         
-        # 🧠 종합적 재질문 생성 (맥락 고려) - LLM 활용
-        if route == "clarify":
-            enhanced_question = _generate_llm_clarification(
-                user_query, recent_context, context_analysis, client
-            )
-            intent_eval["clarify_question"] = enhanced_question
+        # 🧠 **통합 완료** - INTENT_GATE_PROMPT에서 이미 재질문이 생성됨
+        # intent_eval["clarify_question"]에 AI가 생성한 스마트 재질문이 이미 포함되어 있음
         
-        # Intent 평가 결과에 완성률 정보 추가
-        intent_eval["completion_ratio"] = completion_ratio
-        intent_eval["completion_percent"] = completion_percent
-        intent_eval["completion_message"] = completion_message
-        intent_eval["context_analysis"] = context_analysis
+        intent_eval.update({
+            "completion_ratio": completion_ratio,
+            "completion_percent": completion_percent,
+            "completion_message": completion_message,
+            "context_analysis": context_analysis,
+            "_raw_llm": raw,  # 👈 원문 JSON 그대로 보관
+        })
 
         print(f"[완성률] avg_score={avg_score:.3f} → {completion_message}")
 
         # 5) 디버그(원하면 남기되, recent_context엔 안 넣도록 태그 유지)
+        session_history.add_ai_message(f"[INTENT_GATE]{json.dumps(intent_eval, ensure_ascii=False)}")
+    
+         # 🔁 AI 응답 시에도 TTL 슬라이딩
+
         try:
-            session_history.add_ai_message(f"[INTENT_GATE]{json.dumps(intent_eval, ensure_ascii=False)}")
-        except Exception:
-            pass
+            r = redis.from_url(REDIS_URL)
+            r.expire(f"message_store:{session_id}", TIMEOUT_SECONDS)
+        except Exception as e:
+            print(f"[세션 TTL 갱신 오류] {e}")
+
 
         return intent_eval
 
@@ -1517,28 +1596,51 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         f"D={intent_eval.get('direct_match')} C={intent_eval.get('context_match')} "
         f"A={intent_eval.get('attribute_match')} B={intent_eval.get('brand_match')}")
 
-    THRESHOLD = 0.70
+    
 
-    # 🔄 재질문 횟수 추적 및 누적 쿼리 관리
+    # 🔄 재질문 횟수 추적 및 누적 쿼리 관리 - 완전 개선
     clarification_count = 0
     user_query_parts = []
     
     # 세션 히스토리에서 재질문 횟수와 사용자 질문들 수집
     try:
-        for msg in session_history.messages[-15:]:  # 최근 15개 메시지 확인
+        print(f"[디버그] 전체 메시지 수: {len(session_history.messages)}")
+        
+        for i, msg in enumerate(session_history.messages[-20:]):  # 최근 20개 메시지 확인
             content = getattr(msg, "content", "") or ""
-            
-            # 재질문 횟수 카운트
-            if ("needs_clarification" in content or "어떤 종류를 찾으시나요" in content or 
-                "재질문" in content or "🔄" in content):
-                clarification_count += 1
+            if not content.strip():
+                continue
                 
-            # 사용자 메시지만 수집 (INTENT_GATE 태그 제외)
-            elif (hasattr(msg, 'type') and msg.type == 'human' and 
-                  "[INTENT_GATE]" not in content and content.strip()):
-                clean_content = content.strip().replace("찾아줘", "").replace("찾아", "").replace("을", "").replace("를", "").strip()
-                if clean_content and len(clean_content) < 30:  # 너무 긴 질문 제외
-                    user_query_parts.append(clean_content)
+            print(f"[디버그] 메시지 {i}: type={getattr(msg, 'type', 'unknown')}, content='{content[:100]}'")
+            
+            # 🎯 AI 메시지에서 실제 재질문 패턴 감지
+            if hasattr(msg, 'type') and msg.type == 'ai':
+                # 실제 재질문에서 나타나는 패턴들
+                clarification_patterns = [
+                    "어떤 종류를 원하시나요",
+                    "어떤 스타일을",
+                    "어떤 종류를 찾",
+                    "1️⃣", "2️⃣", "3️⃣",  # 선택지 이모지
+                    "더 자세히 알려주세요",
+                    "더 구체적으로",
+                    "추가로",
+                    "알려주시면 더 정확한"
+                ]
+                
+                # 패턴 매칭 확인
+                for pattern in clarification_patterns:
+                    if pattern in content:
+                        clarification_count += 1
+                        print(f"[재질문 감지] {clarification_count}번째 재질문 패턴 '{pattern}' 발견")
+                        break  # 한 메시지에서 여러 패턴 매칭되어도 1회만 카운트
+                
+            # 🔍 사용자 메시지 수집 (INTENT_GATE 태그 제외)
+            elif hasattr(msg, 'type') and msg.type == 'human':
+                if "[INTENT_GATE]" not in content and content.strip():
+                    clean_content = content.strip().replace("찾아줘", "").replace("찾아", "").replace("을", "").replace("를", "").strip()
+                    if clean_content and len(clean_content) < 50:  # 길이 제한 완화
+                        user_query_parts.append(clean_content)
+                        print(f"[사용자 질문 수집] '{clean_content}'")
                     
     except Exception as e:
         print(f"[재질문 추적 오류] {e}")
@@ -1554,7 +1656,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     else:
         combined_query = query
     
-    print(f"[재질문 추적] 횟수={clarification_count}, 사용자질문들={user_query_parts}, 누적쿼리='{combined_query}'")
+    print(f"[재질문 추적 최종] 감지횟수={clarification_count}, 사용자질문={user_query_parts}, 누적쿼리='{combined_query}'")
 
     # clarify 답변 수집
     clarify_answer = None
@@ -1570,7 +1672,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     if route == "proceed":
         pass  # 다음 단계 진행
     else:
-        # 🚨 재질문 횟수 제한 (3번 초과 시 강제 진행)
+        # 🚨 재질문 횟수 제한 (3번 초과 시 강제 진행)   #재질문 횟수 3번만에 대화 완료 목표 4번째에 검색 돌입.
         if clarification_count >= 3:
             print(f"[재질문 제한] {clarification_count}번 재질문 완료 → 누적쿼리로 강제 진행: '{combined_query}'")
             query = combined_query  # 누적된 쿼리로 검색 진행
@@ -1596,18 +1698,20 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     intent_eval = intent_eval_combined
             
             # 재질문 생성
-            followup = intent_eval.get("clarify_question") or "어떤 카테고리를 찾으시나요? 1️⃣의류 2️⃣신발 3️⃣가방 4️⃣화장품 5️⃣전자제품 6️⃣기타"
-            completion_message = intent_eval.get("completion_message", f"💡 질문 완성률: {intent_eval.get('completion_percent', 0)}%")
+            followup = intent_eval.get("clarify_question")
+
+            completion_message = intent_eval.get("completion_message", f"💡{intent_eval.get('completion_percent', 0)}%")
             
             # 재질문 횟수 정보 추가
-            enhanced_followup = f"{followup}\n\n{completion_message}"
+            enhanced = f"{followup}\n\n{completion_message}"
             
             return {
                 "query": combined_query,  # 누적 쿼리로 저장
-                "UserMessage": enhanced_followup,
+                "assistant_message": enhanced,      # 👈 프론트가 우선 사용
+                "UserMessage": enhanced,            # 기존 호환
                 "RawContext": [m.content for m in session_history.messages],
                 "results": [],
-                "combined_message_text": enhanced_followup,
+                "combined_message_text": enhanced,  # 기존 호환
                 "intent_gate": intent_eval,
                 "needs_clarification": True,
                 "completion_percent": intent_eval.get("completion_percent", 0),
@@ -1635,73 +1739,36 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 completion_message = intent_eval.get("completion_message", f"💡 질문 완성률: {intent_eval.get('completion_percent', 0)}%")
                 
                 # 재질문에 완성률 정보 추가
-                enhanced_followup = f"{followup}\n\n{completion_message}"
+                enhanced = f"{followup}\n\n{completion_message}"
                 
                 return {
                     "query": query,
-                    "UserMessage": enhanced_followup,
+                    "UserMessage": enhanced,
                     "RawContext": [m.content for m in session_history.messages],
                     "results": [],
-                    "combined_message_text": enhanced_followup,
+                    "combined_message_text": enhanced,
                     "intent_gate": intent_eval,
                     "needs_clarification": True,
                     "completion_percent": intent_eval.get("completion_percent", 0),
                     "completion_message": completion_message
                 }
 
-    # # clarify 답변 수집
-    # clarify_answer = None
-    # try:
-    #     if isinstance(request, dict):
-    #         clarify_answer = request.get("clarify_answer")
-    #     else:
-    #         clarify_answer = getattr(request, "clarify_answer", None)
-    # except Exception:
-    #     clarify_answer = None
-
-    # # 재질문 횟수 체크
-    # clarify_count = 0
-    # try:
-    #     for msg in session_history.messages[-10:]:
-    #         if hasattr(msg, 'content') and ('[CLARIFY_REQ]' in str(msg.content) or 'needs_clarification' in str(msg.content)):
-    #             clarify_count += 1
-    # except Exception:
-    #     pass
-    # print(f"[재질문횟수] {clarify_count}회 - {'무한루프방지' if clarify_count >= 3 else '정상'}")
-
-    # # 라우팅
-    # if route != "proceed":
-    #     if clarify_count >= 3:
-    #         print(f"[강제통과] 재질문 {clarify_count}회 초과 → 검색 진행")
-    #     elif avg_score < THRESHOLD and not clarify_answer:
-    #         indifferent_patterns = ['상관없', '무관', '아무거나', '어떤거든', '상관 없', '괜찮', '다 좋', '전부','바로검색' ,'바로 검색','즉시검색','그냥검색','바로 찾아','즉시 찾아','그냥 찾아']
-    #         is_indifferent = any(pattern in query.lower() for pattern in indifferent_patterns)
-    #         if is_indifferent:
-    #             print(f"[상관없음감지] '{query}' → 검색 진행")
-    #         else:
-    #             return create_clarify_response(intent_eval, query, session_history, completion_percent, target_lang)
-
-    #     if clarify_answer:
-    #         query = f"{query} {clarify_answer}".strip()
-    #         try:
-    #             session_history.add_user_message(f"[clarify] {clarify_answer}")
-    #         except Exception:
-    #             pass
-
-    #         intent_eval = run_intent_gate(query, session_history, client, target_lang=target_lang, model=LLM_MODEL)
-    #         avg_score = float(intent_eval.get("avg_score", 0.0))
-    #         route = (intent_eval.get("route") or "").lower()
-    #         print(f"[IntentGate-RE] route={route} avg={avg_score:.2f}")
-
-    #         completion_ratio, completion_percent = calculate_completion(avg_score)
-    #         intent_eval["completion_ratio"] = completion_ratio
-    #         intent_eval["completion_percent"] = completion_percent
-
-    #         if route != "proceed" and avg_score < THRESHOLD:
-    #             return create_clarify_response(intent_eval, query, session_history, completion_percent, target_lang)
 
     # ===== 여기까지 내려오면 통과 → 아래 전처리/카테고리/임베딩 검색 계속 =====
     # ===== 통과 시 아래 원래 system_prompt 로직 계속 진행    재질문 END =====
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1737,7 +1804,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
  
             [전처리 원칙]
-            1) 사용자가 모호한 상위개념으로 묻는 경우(예: "한국식 과자", "여름 원피스", "세차용품") → 
+            1) 문장을 이해해서 분석하여 사용자가 찾고자 하는 상품의 모호한 상위개념으로 묻는 경우(예: "한국식 과자", "여름 원피스", "세차용품") → 
             카테고리/유형/대표 상품명으로 확장된 표면어 다발을 만든다.
             *사용자의 문장을 이해해서 추측도 반드시 해본다! 질문에 대해서 답을 생성도 같이해서 제일 앞에 단어를 붙인다.*
 
@@ -2185,7 +2252,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # ---------- 시즌 필터링 적용 ----------
     if season != "미정":
         original_count = len(vector_items)
-        vector_items = ㅊseason_filter_items(vector_items, season)
+        vector_items = season_filter_items(vector_items, season)
         print(f"[시즌필터] {season} 시즌에 맞는 상품으로 필터링: {original_count}개 → {len(vector_items)}개")
 
     # ---------- 직접매칭(문자열) 점수: '제목'만 ----------
@@ -2589,15 +2656,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - 구성/형태: 세트/단품, 접이식, 휴대용, 벽걸이, 2+1 구성 등
     - 호환/범용/시즌: 정품/호환, 규격·사이즈, 여름/겨울 등
     2) 그 특징을 활용해 고객 의도 확인과 선호 파악을 위한 '확인형 질문'을 반드시! 
-
-
-
-
-
-
-
-
-
     3) 상품 코드나 구체 모델명/스펙 나열은 금지합니다. 후보에서 추출한 '특징 키워드'만 요약해 언급하세요.
     4) 친근하면서도 전문적인 대화체를 유지하세요.
     5) 아래 예시는 참고만 하며, 그대로 복사하지 말고 실제 후보의 특징으로 대체하세요.
@@ -2624,11 +2682,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     txt1 = response.choices[0].message.content or ""
     clean = txt1.strip()
     print(f"[Top2-Stage] 전체 카테고리 추가 질문:\n{clean}\n")
-
-    
- 
-
-
 
     # 결과 출력
     print(f"\n총 {len(final_results)}개의 상품이 최종 리스트에 저장되었습니다.")
