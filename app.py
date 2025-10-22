@@ -477,8 +477,8 @@ class Ranker_DirectSearch:
 
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:
     # 🔧 재질문 임계값 통일 설정
-    THRESHOLD = 0.7             # 평균 점수 임계값 (이상이면 검색 진행)
-    DIRECT_MATCH_HIGH = 0.65      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
+    THRESHOLD = 0.6             # 평균 점수 임계값 (이상이면 검색 진행)
+    DIRECT_MATCH_HIGH = 0.6      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
     FACET_COVERAGE_MIN = 0.2     # 최소 속성 커버리지 (미달 시 재질문)
     ATTRIBUTE_MIN = 0.3          # 속성 매칭 최소값
     FACET_SUFFICIENT = 0.35       # 충분한 속성 커버리지
@@ -486,36 +486,51 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     def check_session_timeout(session_history, session_id: str) -> dict:
         """
-        세션의 마지막 활동 시간을 체크하여 자동 만료 처리
+        세션의 마지막 활동 시간을 체크하여 자동 만료 처리.
+        만료(=TTL==0)일 때만 초기화하고, 그 외에는 TTL만 설정/연장.
+        만료 시에는 즉시 상위로 반환하여 이후 로직(검색 등)을 진행하지 않도록 한다.
         """
         try:
             r = redis.from_url(REDIS_URL)
             session_key = f"message_store:{session_id}"
             ttl = r.ttl(session_key)  # 초 단위
             print(f"[세션체크] 세션 {session_id} TTL={ttl}초 (기준={TIMEOUT_SECONDS}초={SESSION_TIMEOUT_MINUTES}분)")
-            
 
-            # TTL이 0 이하 → 만료 처리 (TTL 연장 전에 체크)
-            if ttl <= 0:
-                print(f"[세션만료 감지] TTL={ttl}초, 세션 {session_id} 자동 초기화 시작")
-                
-                # 1. 기존 세션 데이터 완전 삭제
+            # 1) 키 없음(-2) → 새 세션: TTL만 설정하고 진행
+            if ttl == -2:
+                print("[세션체크] 새 세션 - TTL 설정")
+                r.expire(session_key, TIMEOUT_SECONDS)
+                return None
+
+            # 2) 만료시간 미설정(-1) → TTL 설정
+            if ttl == -1:
+                print("[세션체크] TTL 미설정 - TTL 설정")
+                r.expire(session_key, TIMEOUT_SECONDS)
+                return None
+
+            # 3) 만료(0) → 초기화 후 안내 반환 (이 요청에서는 즉시 종료)
+            #    경계 흔들림이 걱정되면 ttl <= 1 로 완화 가능
+            if ttl == 0:
+                print(f"[세션만료 감지] TTL=0, 세션 {session_id} 자동 초기화 시작")
+
+                # 기존 메시지 삭제
                 clear_message_history(session_id)
-                
-                # 2. 초기화 메시지 생성
-                msg = (f"💫 마지막 대화가 {SESSION_TIMEOUT_MINUTES}분 동안 없어 자동으로 초기화되었습니다.\n\n새로운 상품 검색을 시작해보세요! 😊")
 
-                # 3. 새로운 세션에 초기화 메시지 저장
+                # 안내 메시지
+                msg = (
+                    f"💫 The last conversation was not present for 0.5 minutes and was automatically initialized. Start Search for New Products! Enter Your Search Word 😊\n\n"
+                )
+
+                # 새 세션에 안내 메시지 저장 + TTL 설정
                 try:
                     new_session_history = RedisChatMessageHistory(session_id=session_id, url=REDIS_URL)
                     new_session_history.add_ai_message(msg)
-                    # 새 세션 TTL 설정
                     r.expire(session_key, TIMEOUT_SECONDS)
-                    print(f"[세션만료] 새 세션 생성 및 초기화 메시지 저장 완료")
+                    print("[세션만료] 새 세션 생성 및 초기화 메시지 저장 완료")
                 except Exception as e:
                     print(f"[세션만료 안내 기록 오류] {e}")
 
-                print(f"[세션만료] 응답 반환: session_expired=True")
+                print("[세션만료] 응답 반환: session_expired=True")
                 return {
                     "query": "auto_reset",
                     "assistant_message": msg,
@@ -525,26 +540,18 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     "combined_message_text": msg,
                     "needs_clarification": False,
                     "auto_reset": True,
-                    "session_expired": True
+                    "session_expired": True,
                 }
 
-            # 만료되지 않았으면 TTL 연장
-            if ttl == -2:  # 새 세션
-                print(f"[세션체크] 새 세션 - TTL 설정")
-                r.expire(session_key, TIMEOUT_SECONDS)
-                return None
-            elif ttl == -1:  # TTL 미설정
-                print(f"[세션체크] TTL 미설정 - TTL 설정")
-                r.expire(session_key, TIMEOUT_SECONDS)
-                return None
-            else:  # 정상 세션
-                print(f"[세션체크] 정상 세션 - TTL 연장")
-                r.expire(session_key, TIMEOUT_SECONDS)
-                return None
+            # 4) 정상 세션(ttl > 0) → TTL 연장
+            print("[세션체크] 정상 세션 - TTL 연장")
+            r.expire(session_key, TIMEOUT_SECONDS)
+            return None
 
         except Exception as e:
             print(f"[세션체크 오류] {e}")
             return None
+
 
 
 
@@ -648,11 +655,23 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             raise HTTPException(status_code=500, detail="대화 기록 초기화 중 오류가 발생했습니다.")
         
 
-    ##############################################################################원본 사용자 쿼리
-        # ✅ 세션 초기화 명령 처리
-    total_start_time = time.time()  # 전체 시작 시간 기록
-    
+    def set_session_ttl(session_id: str, ttl_seconds: int = TIMEOUT_SECONDS):
+        """
+        세션의 TTL을 설정하는 공통 함수
+        """
+        try:
+            r = redis.from_url(REDIS_URL)
+            session_key = f"message_store:{session_id}"
+            r.expire(session_key, ttl_seconds)
+            print(f"[TTL 설정] 세션 {session_id} TTL={ttl_seconds}초 설정 완료")
+            return True
+        except Exception as e:
+            print(f"[TTL 설정 오류] 세션 {session_id}: {e}")
+            return False
 
+    ##############################################################################원본 사용자 쿼리
+    # ✅ 세션 초기화 명령 처리
+    total_start_time = time.time()  # 전체 시작 시간 기록
     # ✅ 입력 쿼리 추출 및 타입 확인
     query = request if isinstance(request, str) else request.query
     print(f"🔍 사용자 검색어: {query}")
@@ -672,6 +691,13 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # ✅ Redis 세션 기록 불러오기 및 최신 입력 저장
     session_history = get_session_history(session_id)
 
+
+
+    # � **핵심 수정**: 리셋 직후에는 세션 타임아웃 체크 건너뛰기
+    # 리셋 직후 첫 메시지인지 확인 (history가 비어있거나 1개 이하면 리셋 직후)
+    messages = session_history.messages if hasattr(session_history, 'messages') else []
+    is_after_reset = len(messages) <= 1
+    
     # 🕒 세션 자동 만료 체크 (경고 없이 바로 처리)
     timeout_result = check_session_timeout(session_history, session_id)
     print(f"[세션체크] timeout_result={timeout_result}")
@@ -1226,22 +1252,27 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # 🎯 가중평균 계산 (direct_match 중심)
         avg = 0.6*d + 0.2*a + 0.1*c + 0.1*b
         
+        # 🎯 우선: 컨텍스트 + 직접매칭 조합 (특별 케이스)
+        if c >= 0.3 and c <= 0.4 and d >= DIRECT_MATCH_HIGH:
+            route = "proceed"
+            print(f"[Route] 컨텍스트+직접매칭 조합({c:.3f}≥0.3 + {d:.3f}≥0.7) → 특별 통과")
+            
         # 🚀 1차: 높은 직접 매칭 - 단독 통과 가능
-        if d >= DIRECT_MATCH_HIGH:
+        elif d >= DIRECT_MATCH_HIGH:
             route = "proceed"
             print(f"[Route] 직접매칭 높음({d:.3f}≥{DIRECT_MATCH_HIGH}) → 단독 통과")
             
         # 🔍 2차: 속성 매칭 검증
-        elif a >= ATTRIBUTE_MIN and d >= 0.6:
+        elif a >= ATTRIBUTE_MIN and d >= 0.5:
             # 직접매칭이 중간 이상이고 속성매칭이 충분한 경우
             route = "proceed"
-            print(f"[Route] 속성매칭 충분({a:.3f}≥{ATTRIBUTE_MIN}) + 직접매칭 중간({d:.3f}≥0.6) → 통과")
-            
+            print(f"[Route] 속성매칭 충분({a:.3f}≥{ATTRIBUTE_MIN}) + 직접매칭 중간({d:.3f}≥0.5) → 통과")
+
         # 📊 3차: 종합 점수 + 최소 속성 커버리지 검증
-        elif avg >= THRESHOLD * 0.8:  # THRESHOLD의 80% 이상
+        elif avg >= THRESHOLD * 0.6:  # THRESHOLD의 60% 이상
             if a >= FACET_COVERAGE_MIN:
                 route = "proceed" 
-                print(f"[Route] 종합점수 높음({avg:.3f}≥{THRESHOLD*0.8:.3f}) + 속성커버 충족({a:.3f}≥{FACET_COVERAGE_MIN}) → 통과")
+                print(f"[Route] 종합점수 높음({avg:.3f}≥{THRESHOLD*0.6:.3f}) + 속성커버 충족({a:.3f}≥{FACET_COVERAGE_MIN}) → 통과")
             else:
                 route = "clarify"
                 print(f"[Route] 종합점수 높지만 속성커버 부족({a:.3f}<{FACET_COVERAGE_MIN}) → 재질문")
@@ -1306,8 +1337,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             # 축약형/간단한 명령어
             'direct', 'immediate', 'instant', 'now',
             'go', 'just do it', 'skip', 'proceed'
-
-
         ]
         
         query_lower = user_query.lower().replace(' ', '')
@@ -1425,6 +1454,40 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - "타바스코" → "핫소스, 매운소스, 칠리소스, 고추소스"  
     - "삼발올렉" → "인도네시아 칠리소스, 매운 디핑소스, 아시아 핫소스"
     - "우산" → "우산, 양산, 접이식우산, 장우산, 자동우산, 방수우산"
+    
+    🏷️ **브랜드 확장 역할 (중요!):**
+    사용자가 "브랜드 운동화", "브랜드 신발", "유명한 브랜드", "명품 브랜드" 등을 언급하면:
+    
+    **당신의 역할**: 해당 카테고리에서 가장 잘 알려진 대표 브랜드 3-5개를 자동으로 선정하여 expanded_terms에 포함시키세요.
+    
+    **브랜드 선정 기준**:
+    - 한국 시장에서 인지도가 높은 브랜드 우선
+    - 해당 카테고리의 대표적인 글로벌 브랜드
+    - 온라인 쇼핑몰에서 쉽게 찾을 수 있는 브랜드
+    - 다양한 가격대를 아우르는 브랜드 (고급/중급/보급)
+    
+    **자동 추론 예시**:
+    - "브랜드 운동화" → 운동화 분야 대표 브랜드들을 스스로 선정
+    - "명품 가방" → 럭셔리 가방 브랜드들을 스스로 선정  
+    - "브랜드 화장품" → 유명 화장품 브랜드들을 스스로 선정
+    - "브랜드 시계" → 시계 브랜드들을 스스로 선정
+    
+    **주의사항**: 리스트를 암기하지 말고, 상황에 맞는 브랜드를 유연하게 추론하세요.
+    
+    🔍 **일반 확장 역할**:
+    사용자가 추상적이거나 모호한 표현을 사용할 때도 구체적인 검색어로 확장하세요:
+    
+    **예시 상황별 확장 방법**:
+    - "겨울 아이템" → 겨울에 필요한 구체적인 상품들로 확장
+    - "운동용품" → 다양한 운동 관련 구체적 용품들로 확장  
+    - "건강식품" → 실제 건강식품 카테고리들로 확장
+    - "생활용품" → 일상생활 필수 아이템들로 확장
+    - "패션 아이템" → 구체적인 의류/악세서리 종류들로 확장
+    
+    **확장 원칙**: 
+    1. 사용자 의도를 정확히 파악하고
+    2. 해당 카테고리의 대표적인 하위 개념들을 3-6개 선정
+    3. 검색에 실제로 도움이 되는 구체적인 키워드로 변환
 
 
     **3단계: 점수 평가**
@@ -1446,33 +1509,28 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - **비교 기준 명시**: 크기, 재질, 기능, 브랜드, 가격대 등 실제 비교할 수 있는 기준 제시
     - **사용 시나리오**: 언제, 어디서, 누가 사용하는지에 간결히
     - **성능/품질 차이**: 고급형 vs 보급형, 전문용 vs 일반용 등의 차이 설명
-    - 한 문단+선택지 이모지 1️⃣~6️⃣ (의미 중복/모호어 금지)
+    - 한 문단+선택지 이모지 1️⃣~4️⃣ (의미 중복/모호어 금지)
     - 마지막에 자유기입 한 줄
 
     **역할 중재(Explain-or-Search, 암묵 추론)**
     - 문자열 규칙이 아니라 **지배적 의도**로 판단.
 
     - 지배적 의도가 **설명/정의/차이/의미 질문**(예: "~가 뭐야", "~차이", "~뜻?")이면:
-    1) {target_lang}로 **한 줄 정의(최대 120자)**를 먼저 제시하고,
+    1) {target_lang}로 **한 줄 정의(최대 170자)**를 먼저 제시하고,
 
-    2) 즉시 이어서 **짧은 선택지형 브릿지 질문(1️⃣~6️⃣)**로 구매 탐색으로 연결한다.
+    2) 즉시 이어서 **짧은 선택지형 브릿지 질문( 1️⃣~4️⃣)**로 구매 탐색으로 연결한다.
 
     3) 이 두 줄을 **clarify_question**에 넣고, 기본적으로 **route="clarify"**로 둔다.
         (단, 질의 안에 **명시적 구매 의사**와 **구체 항목**이 함께 있으면 route="proceed" 가능)
 
     4) **expanded_terms**에는 실제 검색에 유용한 3~6개 키워드를 넣는다(동의어/유사 스타일/연관 카테고리).
-    - 지배적 의도가 **구매 탐색**이면: 점수 계산에 따라 proceed/clarify를 선택. clarify일 경우 선택지형 재질문만 제시.
-    - **장문 금지**: 정의 1줄 + 질문 1줄. 모델명/스펙 나열 금지. 검색 친화 키워드만 요약.
     - 예시(형식 참고용):
     clarify_question:
-    "페미닌은 부드럽고 우아한 무드로, 레이스·플리츠·플레어와 파스텔 톤이 자주 쓰여요.
-    어떤 아이템으로 볼까요? 1️⃣원피스 2️⃣블라우스 3️⃣스커트 4️⃣가디건 5️⃣액세서리 6️⃣기타(자유입력)"
+
 
 
     **정보성 질의에도 적용되는 재질문 가이드(모든 카테고리 공통):**
-    - **고객 혜택 중심**: “이런 점이 편해집니다” 한 줄
-    - **차별화 포인트**: “다른 제품과의 차이” 한 줄
-    - **라이프스타일 매칭**: “이런 분들께 적합” 한 줄
+    - 제공되는 문장을 잘 읽어보고 판단해서 문맥에 어울리는 답변을 제대로 답변.
     - 과장/마켓팅 문구 금지. 구체 키워드만.
         
     🌍 **언어 매칭 규칙:**
@@ -1658,28 +1716,33 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     
     print(f"[재질문 추적 최종] 감지횟수={clarification_count}, 사용자질문={user_query_parts}, 누적쿼리='{combined_query}'")
 
-    # clarify 답변 수집
-    clarify_answer = None
-    try:
-        if isinstance(request, dict):
-            clarify_answer = request.get("clarify_answer")
-        else:
-            clarify_answer = getattr(request, "clarify_answer", None)
-    except Exception:
-        clarify_answer = None
-
-    # ★ route 우선 적용 (direct_match≥0.8 포함)
-    if route == "proceed":
-        pass  # 다음 단계 진행
+    # 🚀 **핵심 수정**: 바로검색 명령어 우선 확인 (Intent Gate 이전)
+    if check_direct_search_command(combined_query if len(user_query_parts) > 1 else query):
+        search_query = combined_query if len(user_query_parts) > 1 else query
+        print(f"[바로검색] 명령어 감지: '{search_query}' → Intent Gate 건너뛰고 바로 검색")
+        query = search_query
+        pass  # 바로 검색으로 진행
     else:
-        # 🚨 재질문 횟수 제한 (3번 초과 시 강제 진행)   #재질문 횟수 3번만에 대화 완료 목표 4번째에 검색 돌입.
-        if clarification_count >= 3:
+        # clarify 답변 수집
+        clarify_answer = None
+        try:
+            if isinstance(request, dict):
+                clarify_answer = request.get("clarify_answer")
+            else:
+                clarify_answer = getattr(request, "clarify_answer", None)
+        except Exception:
+            clarify_answer = None
+
+        # ★ route 우선 적용 (direct_match≥0.8 포함)
+        if route == "proceed":
+            pass  # 다음 단계 진행
+        elif clarification_count >= 3:
+            # 🚨 재질문 횟수 제한 (3번 초과 시 강제 진행)   #재질문 횟수 3번만에 대화 완료 목표 4번째에 검색 돌입.
             print(f"[재질문 제한] {clarification_count}번 재질문 완료 → 누적쿼리로 강제 진행: '{combined_query}'")
             query = combined_query  # 누적된 쿼리로 검색 진행
-            pass  # 검색으로 진행
-            
-        # 평균 점수 미달 + 보강답변 없음 → 재질문 (3번 미만일 때만)
+            # 강제로 검색 진행 (재질문 건너뛰기)
         elif avg_score < THRESHOLD and not clarify_answer:
+            # 평균 점수 미달 + 보강답변 없음 → 재질문 (3번 미만일 때만)
             # 🧠 누적 쿼리로 재평가 (쿼리가 실제로 달라졌을 때만)
             if combined_query != query and len(user_query_parts) > 1:
                 print(f"[누적 재평가] 기존 쿼리='{query}' → 누적 쿼리='{combined_query}'")
@@ -1691,34 +1754,51 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 if route_combined == "proceed" or avg_score_combined >= THRESHOLD:
                     print(f"[누적 재평가] 통과! avg={avg_score_combined:.3f} → 검색 진행")
                     query = combined_query
-                    pass  # 검색으로 진행
+                    # 재질문 건너뛰고 검색으로 진행
                 else:
                     print(f"[누적 재평가] 여전히 부족 avg={avg_score_combined:.3f} → 재질문")
                     # 누적 평가 결과를 사용
                     intent_eval = intent_eval_combined
-            
-            # 재질문 생성
-            followup = intent_eval.get("clarify_question")
-
-            completion_message = intent_eval.get("completion_message", f"💡{intent_eval.get('completion_percent', 0)}%")
-            
-            # 재질문 횟수 정보 추가
-            enhanced = f"{followup}\n\n{completion_message}"
-            
-            return {
-                "query": combined_query,  # 누적 쿼리로 저장
-                "assistant_message": enhanced,      # 👈 프론트가 우선 사용
-                "UserMessage": enhanced,            # 기존 호환
-                "RawContext": [m.content for m in session_history.messages],
-                "results": [],
-                "combined_message_text": enhanced,  # 기존 호환
-                "intent_gate": intent_eval,
-                "needs_clarification": True,
-                "completion_percent": intent_eval.get("completion_percent", 0),
-                "completion_message": completion_message,
-                "clarification_count": clarification_count + 1,
-                "accumulated_query": combined_query
-            }
+                    
+                    # 재질문 생성
+                    followup = intent_eval.get("clarify_question")
+                    completion_message = intent_eval.get("completion_message", f"💡{intent_eval.get('completion_percent', 0)}%")
+                    enhanced = f"{followup}\n\n{completion_message}"
+                    
+                    return {
+                        "query": combined_query,  # 누적 쿼리로 저장
+                        "assistant_message": enhanced,      # 👈 프론트가 우선 사용
+                        "UserMessage": enhanced,            # 기존 호환
+                        "RawContext": [m.content for m in session_history.messages],
+                        "results": [],
+                        "combined_message_text": enhanced,  # 기존 호환
+                        "intent_gate": intent_eval,
+                        "needs_clarification": True,
+                        "completion_percent": intent_eval.get("completion_percent", 0),
+                        "completion_message": completion_message,
+                        "clarification_count": clarification_count + 1,
+                        "accumulated_query": combined_query
+                    }
+            else:
+                # 다른 재질문 조건들
+                followup = intent_eval.get("clarify_question")
+                completion_message = intent_eval.get("completion_message", f"💡{intent_eval.get('completion_percent', 0)}%")
+                enhanced = f"{followup}\n\n{completion_message}"
+                
+                return {
+                    "query": combined_query,  # 누적 쿼리로 저장
+                    "assistant_message": enhanced,      # 👈 프론트가 우선 사용
+                    "UserMessage": enhanced,            # 기존 호환
+                    "RawContext": [m.content for m in session_history.messages],
+                    "results": [],
+                    "combined_message_text": enhanced,  # 기존 호환
+                    "intent_gate": intent_eval,
+                    "needs_clarification": True,
+                    "completion_percent": intent_eval.get("completion_percent", 0),
+                    "completion_message": completion_message,
+                    "clarification_count": clarification_count + 1,
+                    "accumulated_query": combined_query
+                }
 
         # 보강답변이 있으면 재평가
         if clarify_answer:
@@ -2493,7 +2573,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             # 시즌 필터링 적용
             if season != "미정":
                 original_count = len(results)
-                results = ㅊseason_filter_items(results, season)
+                results = season_filter_items(results, season)
                 print(f"[방법2/{category}] {season} 시즌 필터링: {original_count}개 → {len(results)}개")
 
             return results
@@ -2686,7 +2766,89 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # 결과 출력
     print(f"\n총 {len(final_results)}개의 상품이 최종 리스트에 저장되었습니다.")
     
-    print("\n상위 10개 상품 상세 정보:")
+    # 🎯 LLM 리랭킹: 상위 10개 상품을 사용자 쿼리에 맞게 재정렬
+    top_10_products = final_results[:10]
+    
+    # 리랭킹용 프롬프트 생성
+    products_for_ranking = []
+    for idx, item in enumerate(top_10_products):
+        products_for_ranking.append(f"{idx}. {item['제목']}")
+    
+    # 🎯 리랭킹용 쿼리 선택: 누적쿼리 우선 사용
+    if len(user_query_parts) > 1 and combined_query != query:
+        ranking_query = combined_query  # 누적된 대화 맥락 활용
+        query_type = "누적쿼리"
+    else:
+        ranking_query = query  # 단일 질문인 경우 원본 쿼리
+        query_type = "원본쿼리"
+    
+    print(f"[LLM 리랭킹] {query_type} 사용: '{ranking_query}'")
+    
+    # 🔍 리랭킹 전 상품 제목들 출력
+    print(f"\n{'='*60}")
+    print(f"📋 [리랭킹 전] 상위 10개 상품 제목:")
+    print(f"{'='*60}")
+    for idx, item in enumerate(top_10_products):
+        print(f"{idx}. {item['제목']}")
+    print(f"{'='*60}")
+    
+    ranking_prompt = f"""사용자가 "{ranking_query}"를 검색했습니다.
+
+다음 10개 상품을 사용자의 검색 의도에 가장 적합한 순서대로 0부터 9까지 번호를 매겨 재정렬해주세요.
+
+상품 목록:
+{chr(10).join(products_for_ranking)}
+
+응답 형식: 0,1,2,3,4,5,6,7,8,9 (쉼표로 구분된 숫자만)
+예시: 2,0,5,1,8,3,7,4,9,6
+
+재정렬된 순서:"""
+
+    try:
+        # LLM으로 리랭킹 순서 받기
+        rerank_response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": ranking_prompt}],
+            temperature=0.1,
+            max_tokens=50
+        )
+        
+        rerank_order = rerank_response.choices[0].message.content.strip()
+        print(f"[LLM 리랭킹] 새로운 순서: {rerank_order}")
+        
+        # 순서 파싱 및 적용
+        try:
+            order_indices = [int(x.strip()) for x in rerank_order.split(',')]
+            if len(order_indices) == 10 and all(0 <= x <= 9 for x in order_indices):
+                # 리랭킹 적용
+                reranked_products = [top_10_products[i] for i in order_indices]
+                final_results[:10] = reranked_products  # 상위 10개만 교체
+                print(f"[LLM 리랭킹] 성공적으로 재정렬됨")
+                
+                # 🔍 리랭킹 후 상품 제목들 출력
+                print(f"\n{'='*60}")
+                print(f"🎯 [리랭킹 후] 재정렬된 상위 10개 상품 제목:")
+                print(f"{'='*60}")
+                for idx, item in enumerate(reranked_products):
+                    print(f"{idx}. {item['제목']}")
+                print(f"{'='*60}")
+                
+            else:
+                print(f"[LLM 리랭킹] 잘못된 형식, 원본 순서 유지")
+                print(f"🔍 원본 순서 그대로 사용")
+        except (ValueError, IndexError) as e:
+            print(f"[LLM 리랭킹] 파싱 오류: {e}, 원본 순서 유지")
+            
+    except Exception as e:
+        print(f"[LLM 리랭킹] 오류 발생: {e}, 원본 순서 유지")
+        print(f"\n{'='*60}")
+        print(f"⚠️ [리랭킹 실패] 원본 순서 그대로 사용:")
+        print(f"{'='*60}")
+        for idx, item in enumerate(top_10_products):
+            print(f"{idx}. {item['제목']}")
+        print(f"{'='*60}")
+    
+    print("\n🎯 최종 리랭킹된 상위 10개 상품:")
     for idx, item in enumerate(final_results[:10], 1):
         print(f"\n{idx}. {item['제목']}")
         print(f"   카테고리: {item['카테고리']}")
@@ -2716,12 +2878,13 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         if "최대구매수량" not in product:
             product["최대구매수량"] = 0       
 
+
     result_payload = {
         "query": query,  # 사용자가 입력한 원본 쿼리
         "UserMessage": llm_response,  # 정제된 쿼리
         "RawContext": previous_queries + [query],  # 전체 대화 맥락
         "results": final_results,  # 검색 결과 리스트 (방법2 5개 + 방법1 5개 = 10개)
-        "combined_message_text": clean,  # 사용자에게 보여줄 메시지
+        "combined_message_text": clean,  # 🎯 세션 만료 메시지 포함 가능
         "message_history": [
             {"type": type(msg).__name__, "content": getattr(msg, "content", "")}
             for msg in session_history.messages
