@@ -477,11 +477,11 @@ class Ranker_DirectSearch:
 
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:
     # 🔧 재질문 임계값 통일 설정
-    THRESHOLD = 0.6             # 평균 점수 임계값 (이상이면 검색 진행)
-    DIRECT_MATCH_HIGH = 0.6      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
-    FACET_COVERAGE_MIN = 0.2     # 최소 속성 커버리지 (미달 시 재질문)
-    ATTRIBUTE_MIN = 0.3          # 속성 매칭 최소값
-    FACET_SUFFICIENT = 0.35       # 충분한 속성 커버리지
+    THRESHOLD = 0.75             # 평균 점수 임계값 (이상이면 검색 진행)
+    DIRECT_MATCH_HIGH = 0.7      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
+    FACET_COVERAGE_MIN = 0.4     # 최소 속성 커버리지 (미달 시 재질문)
+    ATTRIBUTE_MIN = 0.4          # 속성 매칭 최소값
+    FACET_SUFFICIENT = 0.5       # 충분한 속성 커버리지
 
 
     def check_session_timeout(session_history, session_id: str) -> dict:
@@ -655,19 +655,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             raise HTTPException(status_code=500, detail="대화 기록 초기화 중 오류가 발생했습니다.")
         
 
-    def set_session_ttl(session_id: str, ttl_seconds: int = TIMEOUT_SECONDS):
-        """
-        세션의 TTL을 설정하는 공통 함수
-        """
-        try:
-            r = redis.from_url(REDIS_URL)
-            session_key = f"message_store:{session_id}"
-            r.expire(session_key, ttl_seconds)
-            print(f"[TTL 설정] 세션 {session_id} TTL={ttl_seconds}초 설정 완료")
-            return True
-        except Exception as e:
-            print(f"[TTL 설정 오류] 세션 {session_id}: {e}")
-            return False
+
 
     ##############################################################################원본 사용자 쿼리
     # ✅ 세션 초기화 명령 처리
@@ -710,7 +698,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-    session_history.add_user_message(query)
+    if not locals().get('skip_add_user_message'):
+        session_history.add_user_message(query)
 
     # 🔁 마지막 활동 기준으로 TTL 갱신(슬라이딩)
     try:
@@ -1413,6 +1402,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     출력은 반드시 JSON 한 덩어리만. 다른 문장/주석 금지.
 
     [사용자 질의] {user_query}
+    단답형으로 입력이 되면 LLM이 답변한 선택지에 답한거니 그걸 관련 대화를 이어가세요.
     [이전 대화 요약] {recent_context or '없음'}
 
     ⚡ **0단계: 엄격한 자동 진행 규칙 (Strict Auto-Proceed)**
@@ -1509,16 +1499,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - **비교 기준 명시**: 크기, 재질, 기능, 브랜드, 가격대 등 실제 비교할 수 있는 기준 제시
     - **사용 시나리오**: 언제, 어디서, 누가 사용하는지에 간결히
     - **성능/품질 차이**: 고급형 vs 보급형, 전문용 vs 일반용 등의 차이 설명
-    - 한 문단+선택지 이모지 1️⃣~4️⃣ (의미 중복/모호어 금지)
+    - 한 문단+선택지 이모지 A~D (의미 중복/모호어 금지)
     - 마지막에 자유기입 한 줄
 
     **역할 중재(Explain-or-Search, 암묵 추론)**
-    - 문자열 규칙이 아니라 **지배적 의도**로 판단.
 
     - 지배적 의도가 **설명/정의/차이/의미 질문**(예: "~가 뭐야", "~차이", "~뜻?")이면:
-    1) {target_lang}로 **한 줄 정의(최대 170자)**를 먼저 제시하고,
+    1) {target_lang}로 **한 줄 정의(170자 내외)**를 먼저 제시하고,
 
-    2) 즉시 이어서 **짧은 선택지형 브릿지 질문( 1️⃣~4️⃣)**로 구매 탐색으로 연결한다.
+    2) 즉시 이어서 **짧은 선택지형 브릿지 질문(A~D)**로 구매 탐색으로 연결한다.
 
     3) 이 두 줄을 **clarify_question**에 넣고, 기본적으로 **route="clarify"**로 둔다.
         (단, 질의 안에 **명시적 구매 의사**와 **구체 항목**이 함께 있으면 route="proceed" 가능)
@@ -1645,6 +1634,98 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
         return intent_eval
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # --- 선택지 해석 유틸 ---
+    def _parse_abcd_answer(text: str):
+        raw = re.sub(r'[\s\)\].,:;~…!\?-]+', '', text).lower()
+        # 한글 표기/서수어/숫자까지 매핑
+        mapping = {
+            'a':'A','1':'A','에이':'A','첫번째':'A','첫째':'A','첫번':'A',
+            'b':'B','2':'B','비':'B','두번째':'B','둘째':'B','두번':'B',
+            'c':'C','3':'C','씨':'C','세번째':'C','셋째':'C','세번':'C',
+            'd':'D','4':'D','디':'D','네번째':'D','넷째':'D','네번':'D',
+        }
+        return mapping.get(raw)
+
+    def _extract_last_choices(history) -> dict:
+        ai_msgs = [m.content for m in history.messages if isinstance(m, AIMessage)]
+        for s in reversed(ai_msgs):
+            # 선택지 형식 탐지(유연하게): A) / A. / A: 모두 허용
+            if not re.search(r'\b[A-D]\s*[\)\.\:]', s, re.I):
+                continue
+            t = ' ' + re.sub(r'\s+', ' ', s) + ' '
+            pairs = {}
+            sep = r'[\)\.\:]'
+            for label in ['A','B','C','D']:
+                m = re.search(rf'\b{label}\s*{sep}\s*(.+?)(?=\s+[A-D]\s*{sep}|\s*$)', t, re.I)
+                if m:
+                    pairs[label] = m.group(1).strip(' ,.;')
+            if pairs:
+                return pairs
+        return {}
+
+    # --- 여기부터 삽입 (run_intent_gate 호출 전에) ---
+    choice_letter = _parse_abcd_answer(query)
+    if choice_letter:
+        options = _extract_last_choices(session_history)
+        if options.get(choice_letter):
+            resolved = options[choice_letter]
+            print(f"[선택지 매핑] '{query}' → '{resolved}'")
+            query = resolved
+            # 히스토리에 의미 있는 텍스트로 남겨두면 이후 파이프라인이 더 안정적
+            session_history.add_user_message(f"[clarify]{resolved}")
+            # 이 줄을 썼다면, 바로 아래 원래의 add_user_message(query)는 건너뜁니다.
+            skip_add_user_message = True
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     # ===== Intent Gate 실행 및 게이트 판정 =====
     intent_eval = run_intent_gate(query, session_history, client, model=LLM_MODEL)
     avg_score = float(intent_eval.get("avg_score", 0.0))
@@ -1678,7 +1759,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     "어떤 종류를 원하시나요",
                     "어떤 스타일을",
                     "어떤 종류를 찾",
-                    "1️⃣", "2️⃣", "3️⃣",  # 선택지 이모지
                     "더 자세히 알려주세요",
                     "더 구체적으로",
                     "추가로",
@@ -1832,6 +1912,13 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     "completion_percent": intent_eval.get("completion_percent", 0),
                     "completion_message": completion_message
                 }
+
+
+
+
+
+
+
 
 
     # ===== 여기까지 내려오면 통과 → 아래 전처리/카테고리/임베딩 검색 계속 =====
