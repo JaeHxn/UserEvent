@@ -12,7 +12,6 @@ import redis
 
 from langdetect import detect
 from collections import defaultdict, Counter
-import math
 # langchain 의존성을 선택적으로 import
 try:
     from langchain.retrievers.document_compressors import CrossEncoderReranker
@@ -52,7 +51,7 @@ from typing import Optional, Union, List, Dict, Any, Tuple, Iterable
 
 #가격인식 임포트
 from decimal import Decimal, InvalidOperation
-
+from rapidfuzz import fuzz
 
 
 
@@ -145,6 +144,31 @@ class ProductViewData(BaseModel):
 
 class SearchData(BaseModel):
     query: str
+
+# 누적 쿼리에서 [clarify], 선택지(A/B/C/D), 숫자, 공백 등 불필요한 토큰 제거
+def clean_accumulated_query(parts: list) -> str:
+    """
+    누적 쿼리에서 [clarify], 선택지(A/B/C/D/1/2/3/4), 공백 등 불필요한 토큰 제거
+    """
+    cleaned = []
+    for p in parts:
+        s = p.strip()
+        # [clarify] 태그 제거
+        s = re.sub(r'^\[clarify\]\s*', '', s)
+        # 단일 선택지(A/B/C/D/1/2/3/4)만 남은 경우 제거
+        if s in {'A', 'B', 'C', 'D', '1', '2', '3', '4','a','b','c','d'}:
+            continue
+        # 완전히 비어있으면 제외
+        if not s:
+            continue
+        cleaned.append(s)
+    return " ".join(cleaned)
+
+
+
+
+
+
 
 #사용자 문장에서 부정적인 단어 처리를 위한 코드
 def strip_minus_terms(q: str) -> str:
@@ -992,21 +1016,21 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     lang_map = {
         "ko": "한국어",
         "en": "English",
-        "zh": "中文",
-        "ja": "日本語",
-        "vi": "Tiếng Việt",  # 베트남어
-        "th": "ไทย",        # 태국어
+        # "zh": "中文",
+        # "ja": "日本語",
+        # "vi": "Tiếng Việt",  # 베트남어
+        # "th": "ไทย",        # 태국어
 
 
-        "fr": "Français",
-        "de": "Deutsch",
-        "es": "Español",
-        "it": "Italiano",
-        "pt": "Português",
-        "ar": "العربية",
-        "fa": "فارسی",
-        "he": "עברית",
-        "sw": "Kiswahili",
+        # "fr": "Français",
+        # "de": "Deutsch",
+        # "es": "Español",
+        # "it": "Italiano",
+        # "pt": "Português",
+        # "ar": "العربية",
+        # "fa": "فارسی",
+        # "he": "עברית",
+        # "sw": "Kiswahili",
     }
 
     target_lang = lang_map.get(lang_code, "English")
@@ -1304,35 +1328,50 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             pass
         return "\n".join(lines[-k:])
 
+    direct_search_patterns = [
+        '바로검색', '바로 검색', '즉시검색', '즉시 검색',
+        '그냥검색', '그냥 검색', '바로찾아', '바로 찾아',
+        '즉시찾아', '즉시 찾아', '그냥찾아', '그냥 찾아',
+        '바로해', '바로 해',
+
+            # 영어 패턴
+        'direct search', 'immediate search', 'instant search',
+        'quick search', 'fast search', 'just search',
+        'search now', 'find now', 'direct find',
+        'immediate find', 'instant find', 'quick find',
+        'fast find', 'just find', 'search directly',
+        'find directly', 'search immediately', 'find immediately',
+        'go search', 'go find', 'do search', 'do find',
+        
+        # 축약형/간단한 명령어
+        'direct', 'immediate', 'instant', 'now',
+        'go', 'just do it', 'skip', 'proceed'
+    ]
+
     def check_direct_search_command(user_query: str) -> bool:
         """
         바로검색 명령어가 포함되어 있는지 확인
         """
-        direct_search_patterns = [
-            '바로검색', '바로 검색', '즉시검색', '즉시 검색',
-            '그냥검색', '그냥 검색', '바로찾아', '바로 찾아',
-            '즉시찾아', '즉시 찾아', '그냥찾아', '그냥 찾아',
-            '바로해', '바로 해',
-
-                # 영어 패턴
-            'direct search', 'immediate search', 'instant search',
-            'quick search', 'fast search', 'just search',
-            'search now', 'find now', 'direct find',
-            'immediate find', 'instant find', 'quick find',
-            'fast find', 'just find', 'search directly',
-            'find directly', 'search immediately', 'find immediately',
-            'go search', 'go find', 'do search', 'do find',
-            
-            # 축약형/간단한 명령어
-            'direct', 'immediate', 'instant', 'now',
-            'go', 'just do it', 'skip', 'proceed'
-        ]
         
         query_lower = user_query.lower().replace(' ', '')
         for pattern in direct_search_patterns:
             if pattern.replace(' ', '') in query_lower:
                 return True
         return False
+    
+    def remove_direct_search_keywords(text: str) -> str:
+        """
+        바로검색 명령어 패턴을 모두 제거
+        """
+        t = text
+        for kw in direct_search_patterns:
+            t = t.replace(kw, "")
+            t = t.replace(kw.replace(" ", ""), "")
+        return t.strip()
+
+
+
+
 
     def analyze_conversation_context(session_history) -> Dict[str, Any]:
         """
@@ -1500,8 +1539,11 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - **사용 시나리오**: 언제, 어디서, 누가 사용하는지에 간결히
     - **성능/품질 차이**: 고급형 vs 보급형, 전문용 vs 일반용 등의 차이 설명
     - 한 문단+선택지 이모지 A~D (의미 중복/모호어 금지)
-    - 마지막에 자유기입 한 줄
 
+    - **선택지 앞의 한 문단 설명에서** 사용자가 "{user_query}"(을)를 찾고 있을 때, 같은 상황에서 함께 고려할 수 있는 다른 상품(예: 우산이면 비옷, 장화 등)도 자연스럽게 "이런 대안도 있으니 어떠신가요?" 식으로 제안하는 문장을 반드시 포함하세요.  
+    - 단, 선택지(A~D)에는 이런 대안 상품을 직접 포함하지 마세요.  
+    - 이 문장은 선택지 바로 앞에 위치해야 하며, 너무 길지 않게 간결하게 작성하세요.
+    
     **역할 중재(Explain-or-Search, 암묵 추론)**
 
     - 지배적 의도가 **설명/정의/차이/의미 질문**(예: "~가 뭐야", "~차이", "~뜻?")이면:
@@ -1744,57 +1786,66 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # 세션 히스토리에서 재질문 횟수와 사용자 질문들 수집
     try:
         print(f"[디버그] 전체 메시지 수: {len(session_history.messages)}")
-        
         for i, msg in enumerate(session_history.messages[-20:]):  # 최근 20개 메시지 확인
             content = getattr(msg, "content", "") or ""
             if not content.strip():
                 continue
-                
             print(f"[디버그] 메시지 {i}: type={getattr(msg, 'type', 'unknown')}, content='{content[:100]}'")
-            
-            # 🎯 AI 메시지에서 실제 재질문 패턴 감지
+            # 🎯 AI 메시지에서 route가 clarify인 경우 카운트
             if hasattr(msg, 'type') and msg.type == 'ai':
-                # 실제 재질문에서 나타나는 패턴들
-                clarification_patterns = [
-                    "어떤 종류를 원하시나요",
-                    "어떤 스타일을",
-                    "어떤 종류를 찾",
-                    "더 자세히 알려주세요",
-                    "더 구체적으로",
-                    "추가로",
-                    "알려주시면 더 정확한"
-                ]
-                
-                # 패턴 매칭 확인
-                for pattern in clarification_patterns:
-                    if pattern in content:
-                        clarification_count += 1
-                        print(f"[재질문 감지] {clarification_count}번째 재질문 패턴 '{pattern}' 발견")
-                        break  # 한 메시지에서 여러 패턴 매칭되어도 1회만 카운트
-                
+
+
+
+
+
+                if content.startswith("[INTENT_GATE]"):
+                    try:
+                        j = json.loads(content[len("[INTENT_GATE]"):])
+                        if (j.get("route") or "").lower() == "clarify":
+                            clarification_count += 1
+                            print(f"[재질문 감지] {clarification_count}번째 (route=clarify) 감지")
+                    except Exception:
+                        pass
+
+
+
+
+
+
+
             # 🔍 사용자 메시지 수집 (INTENT_GATE 태그 제외)
             elif hasattr(msg, 'type') and msg.type == 'human':
                 if "[INTENT_GATE]" not in content and content.strip():
                     clean_content = content.strip().replace("찾아줘", "").replace("찾아", "").replace("을", "").replace("를", "").strip()
-                    if clean_content and len(clean_content) < 50:  # 길이 제한 완화
+                    if clean_content and len(clean_content) < 50:
                         user_query_parts.append(clean_content)
                         print(f"[사용자 질문 수집] '{clean_content}'")
-                    
+        # === [clarify], A/B/C/D 등 불필요한 토큰 제거 ===
+        user_query_parts = [s for s in clean_accumulated_query(user_query_parts).split() if s]
     except Exception as e:
         print(f"[재질문 추적 오류] {e}")
     
     # 사용자 질문들을 의미있게 조합 (최신 것을 우선으로)
     if user_query_parts:
-        # 중복 제거하면서 순서 유지
+        # 중복 제거하면서 순서 유지 (전체)
         unique_parts = []
-        for part in reversed(user_query_parts[-3:]):  # 최근 3개만
+        for part in user_query_parts:
             if part not in unique_parts:
-                unique_parts.insert(0, part)
-        combined_query = " ".join(unique_parts)
+                unique_parts.append(part)
+        # 불필요한 토큰 제거
+        combined_query = clean_accumulated_query(unique_parts)
     else:
         combined_query = query
     
     print(f"[재질문 추적 최종] 감지횟수={clarification_count}, 사용자질문={user_query_parts}, 누적쿼리='{combined_query}'")
+
+
+
+    # 바로검색 명령어 제거
+    query = remove_direct_search_keywords(query)
+    combined_query = remove_direct_search_keywords(combined_query)
+
+
 
     # 🚀 **핵심 수정**: 바로검색 명령어 우선 확인 (Intent Gate 이전)
     if check_direct_search_command(combined_query if len(user_query_parts) > 1 else query):
@@ -1816,13 +1867,13 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ★ route 우선 적용 (direct_match≥0.8 포함)
         if route == "proceed":
             pass  # 다음 단계 진행
-        elif clarification_count >= 3:
-            # 🚨 재질문 횟수 제한 (3번 초과 시 강제 진행)   #재질문 횟수 3번만에 대화 완료 목표 4번째에 검색 돌입.
+        elif clarification_count >= 4:  # 재질문 횟수 6번 초과 시 강제 진행 총합계임.
+            # 🚨 재질문 횟수 제한
             print(f"[재질문 제한] {clarification_count}번 재질문 완료 → 누적쿼리로 강제 진행: '{combined_query}'")
             query = combined_query  # 누적된 쿼리로 검색 진행
             # 강제로 검색 진행 (재질문 건너뛰기)
         elif avg_score < THRESHOLD and not clarify_answer:
-            # 평균 점수 미달 + 보강답변 없음 → 재질문 (3번 미만일 때만)
+            # 평균 점수 미달 + 보강답변 없음 → 재질문
             # 🧠 누적 쿼리로 재평가 (쿼리가 실제로 달라졌을 때만)
             if combined_query != query and len(user_query_parts) > 1:
                 print(f"[누적 재평가] 기존 쿼리='{query}' → 누적 쿼리='{combined_query}'")
@@ -1928,20 +1979,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-
-
-
-
-
-
-
-
-
-
-
     system_prompt = (
         f"""System:
-            당신은 (1) 검색 엔진의 전처리를 담당하는 AI이자, (2) 쇼핑몰 검색 및 분류 전문가입니다.
+            당신은 (1) 검색 엔진 전처리 AI이자, (2) 쇼핑몰 검색·분류 전문가이며, (3) doc2query 생성기입니다.
             입력 언어가 무엇이든 먼저 한국어로 의미 보존 번역을 수행합니다.
             
             
@@ -1971,31 +2011,47 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
  
             [전처리 원칙]
-            1) 문장을 이해해서 분석하여 사용자가 찾고자 하는 상품의 모호한 상위개념으로 묻는 경우(예: "한국식 과자", "여름 원피스", "세차용품") → 
-            카테고리/유형/대표 상품명으로 확장된 표면어 다발을 만든다.
-            *사용자의 문장을 이해해서 추측도 반드시 해본다! 질문에 대해서 답을 생성도 같이해서 제일 앞에 단어를 붙인다.*
-
-            - 확장은 3~7개 사이의 "핵심 하위유형/동의어"로 한정(오버확장 금지).
-            - 브랜드/스펙/색/규격/수량/가격 등 명시 제약이 있으면 보존.
-            - "추천/최고/인기" 같은 수식어는 제거하고, 실제 검색에 유의미한 토큰만 남긴다.
-            2) 한국 쇼핑 맥락의 일반명은 단수 표면형을 우선(복수/어미/조사 제거).
-            3) '용' 같은 불용미사/꼬리표는 제거.
-            4) 불필요한 구두점은 제거. OR, |, 콤마 대신 **공백 나열**만 사용.
-            5) **부정/제외 처리(아주 중요)**:
+            1) 사용자가 모호한 상위개념으로 묻는 경우(예: 한국식 과자, 여름 원피스, 세차용품):
+            - 카테고리/유형/대표 상품명으로 확장하되 3~7개 '핵심 하위유형/동의어'만 엄선 (오버확장 금지).
+            - 브랜드/스펙/색/규격/수량/가격 등 명시 제약은 보존.
+            - '추천/최고/인기' 등 검색 무의미 수식어 제거, 실효 토큰만 남김.
+            2) 한국 쇼핑 맥락의 일반명은 단수 표면형 우선(조사/어미·'용' 꼬리표 제거).
+            3) 불필요한 구두점 제거. OR/|/콤마 대신 공백 나열.
+            4) **부정/제외 처리(아주 중요)**:
             - 다음 패턴을 부정 신호로 인식한다: "싫어/싫다/말고/빼고/제외(하고/한)/아닌/제외해줘/빼줘/미포함/제외 부탁" 등.
             - "A 말고 B", "A는 싫고 B", "B 찾는데 A 제외" 형태에서는 **A는 제외(-A), B는 유지**한다.
             - 제외 토큰은 단어·구를 **표준형으로 정규화**하고 **하이픈(-토큰)** 으로 표기한다(예: -호박맛, -딸기, -화이트).
             - 다단 제외가 있으면 공백으로 나열한다: 예) "사과 주스 -호박맛 -배맛".
             - 핵심 품목이 불명확하고 제외만 존재할 경우, **추정하지 말고 원문 유지**(의미 보존 원칙).
 
-            [중요: 의미 보존]
-            - 핵심 품목이 명확하지 않으면 원문 유지(축약·추정 금지)
+            [doc2query: “사람이 검색할 법한 질의” — 관련/대체/보완 상품만]
+                - 목적: 메인 품목의 변형·동의어는 제외하고, 같은 레벨의 대체·보완·연계 품목만 추천 질의로 생성.
+                - 생성 개수: 8~12개.
+                - 언어: 사용자의 언어 우선. 한국 쇼핑 맥락에 자연스러운 표현 사용.
+                - 길이: 4~28자(공백 포함).
+
+                [허용 대상(반드시 이 범위로만 생성)]
+                - 형제 카테고리의 대체 품목(상위 카테고리 동일)
+                - 보완재/액세서리/소모품/설치부품/세트 구성품
+                - 상·하위 연계 시스템(입·출력 장치, 게이트웨이, 관리 단말 등)
+
+                [금지 규칙(엄격)]
+                - 메인 품목의 동의어/속성 변형/복수형/철자 변형 **전부 금지**
+                - 메인 품목 명칭이 질의에 **포함되면 안 됨**
+                - 브랜드/모델/규격 지어내기 금지(원문·맥락에 없는 고유명사 추정 금지)
+                - 부정/제외가 있으면 해당 대상 포함 질의 생성 금지
+                - 조사/어미만 바뀐 중복 변형 제거
+
+                [품질 기준]
+                - 실제로 함께 많이 구매·설치되는 항목을 우선(액세서리/소모품/설치 키트/연계 장비)
+                - 가능하면 규격·용도·장소 등 핵심 속성을 간결히 반영
+
 
             [Category Search Text:카테고리 검색용 상품 요약 문장 생성]
                 사용자가 찾고자 하는 상품을 이해하고, 카테고리 검색에 최적화된 자연스러운 한국어 문장으로 요약하세요.
                 
                 **요구사항:**
-                1) 길이: 8~16자(공백 제외, 가능하면 12자 내외)
+                1) 길이: 8~16자(공백 포함, 가능하면 12자 내외)
                 2) 관형어 1개 이상 포함: 예) 먹는/쓰는/입는/바르는/메는/신는/쓰는(착용)
                 3) 브랜드/트렌드/마케팅 단어 금지: “다양한, 트렌드, 제품, 합리적, 프리미엄, 스타일리시, 최적”
                 4) 불필요한 종결어미, 존댓말 생략: “~합니다/입니다” → 생략
@@ -2003,9 +2059,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 6) **부정/제외 표현(제외/빼고/말고/without 등) 금지.** 결과 문장은 제외 대상 자체를 언급하지 말 것.
 
                 **올바른 예시:**
-                - "여름용 작은 가방" → "여름용 작은 가방을 찾고 있습니다"
-                - "운동할 때 신는 신발" → "운동용 신는 신발을 찾고 있습니다"  
-                - "겨울 따뜻한 외투" → "겨울철 따뜻한 외투을 찾고 있습니다."
+                - "여름용 작은 가방" → "여름용 작은 가방 입니다"
+                - "운동할 때 신는 신발" → "운동용 신는 신발 입니다"  
+                - "겨울 따뜻한 외투" → "겨울철 따뜻한 외투 입니다"
                 
                 **잘못된 예시 (키워드 나열):**
                 - "여름 작은 가방 쿨 소재 여성" (X)
@@ -2018,6 +2074,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             Raw Query: "<query>"
             Preprocessed Query: "<전처리된_쿼리(핵심 품목 + 유의미 속성만, ‘용’ 제거 후 표준형)>"
             Category Search Text: "<상품을_완전한_문장으로_설명하는_자연스러운_한국어_문장>"
+            Doc2Query: "<q1> | <q2> | <q3> | <q4> | <q5> | <q6>"
+
         """    
     )
 
@@ -2124,9 +2182,171 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             print(f"[Error] Category Search Text 추출 오류: {e}")
             return ""
     
+    def extract_doc2query(llm_text: str, min_len: int = 4, max_len: int = 28):
+
+
+        def _split_pipes(s: str):
+            return [x.strip() for x in s.split("|") if isinstance(x, str) and x.strip()]
+
+        def _norm_key(s: str):
+            return re.sub(r"\s+", " ", s.lower()).strip()
+
+        # 0) 원본 보존 + 선처리
+        text = (llm_text or "").strip()
+
+        # 1) JSON 우선 파싱 (코드펜스/앞뒤 잡음 제거 + 중괄호 블록만 추출)
+        try:
+            _t = text
+            if _t.startswith("```"):
+                _t = _t.strip("` \n")
+                if _t.lower().startswith("json"):
+                    _t = _t[len("json"):].lstrip()
+            i, j = _t.find("{"), _t.rfind("}")
+            if i != -1 and j != -1 and j > i:
+                _t = _t[i:j+1]
+            obj = json.loads(_t)
+            if "Doc2Query" in obj:
+                dq = obj["Doc2Query"]
+                if isinstance(dq, list):
+                    raw = [str(x).strip() for x in dq if str(x).strip()]
+                elif isinstance(dq, str):
+                    raw = _split_pipes(dq)
+                else:
+                    raw = []
+                # 정제
+                seen, out = set(), []
+                for q in raw:
+                    if len(q) < min_len or len(q) > max_len:
+                        continue
+                    k = _norm_key(q)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    out.append(q)
+                return out
+        except Exception:
+            pass
+
+        # 2) 라벨 기반 추출: Doc2Query: "q1 | q2 | q3"
+        m = re.search(r'^\s*Doc2Query\s*:\s*["“]?(.+?)["”]?\s*$', text, re.M | re.I)
+        if m:
+            raw = _split_pipes(m.group(1))
+            seen, out = set(), []
+            for q in raw:
+                if len(q) < min_len or len(q) > max_len:
+                    continue
+                k = _norm_key(q)
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(q)
+            return out
+
+        # 3) 폴백: 파이프 구분 라인 자동 감지 (Doc2Query 라벨이 없어도)
+
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        candidate = ""
+        for ln in lines:
+            if "|" in ln:
+                parts = _split_pipes(ln)
+                if len(parts) >= 2 and len(ln) <= 400:
+                    candidate = ln
+                    break
+        if candidate:
+            raw = _split_pipes(candidate)
+            seen, out = set(), []
+            for q in raw:
+                if len(q) < min_len or len(q) > max_len:
+                    continue
+                k = _norm_key(q)
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(q)
+            return out
+
+        # 4) 최종 빈 리스트
+        return []
+    # ===================== Helper: Doc2Query를 Preprocessed에 병합 검색 단어 증강 =====================
+    def merge_doc2_into_preprocessed(pre_q: str, doc2_list, k: int = 5, max_len: int = 120) -> str:
+        """
+        Preprocessed Query 뒤에 Doc2Query 상위 k개를 공백으로 이어붙여 합친다.
+        - 부정(-토큰) 충돌 질의 제외
+        - 중복/공백 정리
+        - 최종 길이 제한
+        """
+        if not isinstance(pre_q, str):
+            pre_q = str(pre_q or "")
+        doc2_list = doc2_list or []
+
+        # 부정 토큰 수집 (-화이트, -XL 등)
+        minus_terms = {t[1:].strip() for t in pre_q.split() if t.startswith("-") and len(t) > 1}
+
+        def _clean(s: str) -> str:
+            s = (s or "").strip()
+            s = s.replace("|", " ").replace("\"", " ").replace("“", " ").replace("”", " ")
+            s = s.replace("’", "'").replace("‘", "'")
+            s = " ".join(s.split())
+            return s
+
+        picked = []
+        for q in doc2_list:
+            if len(picked) >= k:
+                break
+            cq = _clean(q)
+            if not cq:
+                continue
+            if len(cq) < 2 or len(cq) > 28:
+                continue
+            # 부정 토큰 충돌 제외
+            if any(mt and (mt in cq) for mt in minus_terms):
+                continue
+            # 중복 제거(공백 무시)
+            if any(cq == p or cq.replace(" ", "") == p.replace(" ", "") for p in picked):
+                continue
+            picked.append(cq)
+
+        tail = " ".join(picked).strip()
+        merged = (pre_q + " " + tail).strip() if tail else pre_q
+
+        if len(merged) > max_len:
+            parts = merged.split()
+            cut, cur = [], 0
+            for w in parts:
+                add = len(w) + (1 if cur > 0 else 0)
+                if cur + add > max_len:
+                    break
+                cut.append(w)
+                cur += add
+            merged = " ".join(cut).strip()
+        return merged
+
+
+
+
+
+
+
+    # --- Doc2Query 추출 및 정리 (preprocessed_query와 동일한 위치에서 이어서) start---
+    doc2query_list = extract_doc2query(llm_response)            # 리스트 형태
+    doc2query_str  = " | ".join(doc2query_list) if doc2query_list else ""  # 파이프 병합 문자열
+    # 디버그 로그
+    print(f"[Debug] Doc2Query 리스트 -> {doc2query_list if doc2query_list else '[]'}")
+    print(f"[Debug] Doc2Query 문자열 -> '{doc2query_str}'")
+    # --- Doc2Query 추출 및 정리 (preprocessed_query와 동일한 위치에서 이어서) end---
+
+
+
     category_search_text = extract_category_text_new(llm_response)
     terms = extract_preprocessed(llm_response, query)
     preprocessed_query = strip_minus_terms(terms)
+
+    # ===== Doc2Query 상위 2~3개를 Preprocessed Query에 합치기 =====
+    preprocessed_query_before_merge = preprocessed_query
+    preprocessed_query = merge_doc2_into_preprocessed(preprocessed_query, doc2query_list, k=3, max_len=120)
+    print(f"[Debug] Preprocessed+Doc2 합성 -> '{preprocessed_query}'  (before='{preprocessed_query_before_merge}')")
+
+
     
     # LLM 전처리된 결과에서 가격 조건 재추출 (SIZE_CONDITION은 무시)
     temp_price = extract_price_condition(preprocessed_query)
@@ -2407,11 +2627,22 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     )
 
     # 검색 결과 -> dict 리스트
+    # 상품 제목이 80% 같으면 상품제목 중복제거 추가1
     vector_items = []
     for hits in vector_hits_1000:
         for idx, hit in enumerate(hits):
-            item = _build_info_from_hit(hit)            # 제목/카테고리만 담긴 (본문 X)
-            item["vector_match_score"] = 1000 - idx     # 벡터 1등=1000, 1000등=1 (순위 신호로만 사용)
+            item = _build_info_from_hit(hit)
+            item["vector_match_score"] = 1000 - idx
+            # title = item.get("제목", "")
+            # # 제목 중복(80% 이상) 제거
+            # if any(difflib.SequenceMatcher(None, title, v.get("제목", "")).ratio() >= 0.8 for v in vector_items):
+            #     continue
+
+            title = item.get("제목", "")
+            # difflib → RapidFuzz로 변경
+            if any(fuzz.ratio(title, v.get("제목", "")) >= 40 for v in vector_items):
+                continue
+
             vector_items.append(item)
 
     print(f"[방법1/RRF] 벡터 검색 1000개 완료: {len(vector_items)}개")
@@ -2571,7 +2802,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             # 1. 카테고리 조건 (정확 매칭)
             search_conditions.append(f"category_name == '{category}'")
             
-            # 2. 가격/크기 조건 처리
+            # 2. 가격/크기 조건 처리 
             if price_cond and not price_cond.startswith("SIZE_CONDITION_"):
                 search_conditions.append(price_cond)
                 print(f"[Debug] 카테고리별 검색에 가격 조건 적용: {price_cond}")
@@ -2616,12 +2847,25 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             )
 
             # 검색 결과 -> dict 리스트
+            # 상품 제목이 80% 같으면 상품제목 중복제거 추가2
             items = []
             for hits in vector_hits:
                 for idx, hit in enumerate(hits):
                     item = _build_info_from_hit(hit)
                     item["vector_match_score"] = size - idx
+                    # title = item.get("제목", "")
+                    # # 제목 중복(80% 이상) 제거
+                    # if any(difflib.SequenceMatcher(None, title, v.get("제목", "")).ratio() >= 0.8 for v in items):
+                    #     continue
+
+                    title = item.get("제목", "")
+                    # difflib → RapidFuzz로 변경
+                    if any(fuzz.ratio(title, v.get("제목", "")) >= 40 for v in items):
+                        continue
+
                     items.append(item)
+
+                   
 
             # 직접 매칭 점수 계산
             ds = Ranker_DirectSearch()
@@ -2683,23 +2927,23 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     top2_list = []
     top3_list = []
 
-    # Top1 카테고리에서 10개
+    # Top1 카테고리에서 20개
     if top1_category:
         top1_results = search_by_category_method2(top1_category, size=100)
-        top1_list = top1_results[:10]  # 상위 10개만
-        print(f"[방법2] Top1 ({top1_category}): {len(top1_results)}개 중 10개 선택")
+        top1_list = top1_results[:20]  # 상위 20개만
+        print(f"[방법2] Top1 ({top1_category}): {len(top1_results)}개 중 20개 선택")
 
-    # Top2 카테고리에서 10개  
+    # Top2 카테고리에서 20개  
     if top2_category:
         top2_results = search_by_category_method2(top2_category, size=100)
-        top2_list = top2_results[:10]  # 상위 10개만
-        print(f"[방법2] Top2 ({top2_category}): {len(top2_results)}개 중 10개 선택")
+        top2_list = top2_results[:20]  # 상위 20개만
+        print(f"[방법2] Top2 ({top2_category}): {len(top2_results)}개 중 20개 선택")
 
-    # Top3 카테고리에서 10개
+    # Top3 카테고리에서 20개
     if top3_category:
         top3_results = search_by_category_method2(top3_category, size=100)
-        top3_list = top3_results[:10]  # 상위 10개만
-        print(f"[방법2] Top3 ({top3_category}): {len(top3_results)}개 중 10개 선택")
+        top3_list = top3_results[:20]  # 상위 20개만
+        print(f"[방법2] Top3 ({top3_category}): {len(top3_results)}개 중 20개 선택")
 
     # 방법2 결과를 10개씩 세트로 구성 (2:2:1 비율 유지)
     method2_all_sets = []
@@ -2748,50 +2992,110 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # #################################################################
 
     
-    
-    # final_results 초기화 - 5세트 반복으로 50개 생성
-    final_results = []
-    used_codes = set()  # 전체 중복 방지용
 
-    # 5세트 반복 생성 (총 50개: 10개씩 5세트)
+
+    
+    final_results = []
+    used_codes = set()
+
+    def norm(code):
+        return (code or "").strip().upper()
+
+    total_m2 = 0
+    total_m1 = 0
+
     for set_num in range(5):
         print(f"\n[세트 {set_num + 1}] 생성 시작")
-        
-        # 각 세트마다 10개씩 생성
         set_items = []
-        
-        # 1. 방법2 결과 5개 먼저 추가
+
+        # 1) 방법2 최대 5개
+        method2_added = 0
         if method2_all_sets and set_num < len(method2_all_sets):
-            method2_items = method2_all_sets[set_num][:5]  # 해당 세트에서 5개
-            method2_added = 0
-            for item in method2_items:
-                if item['상품코드'] not in used_codes:
+            for item in method2_all_sets[set_num][:5]:
+                code = norm(item.get('상품코드'))
+                if code and code not in used_codes:
                     set_items.append(item)
-                    used_codes.add(item['상품코드'])
+                    used_codes.add(code)
                     method2_added += 1
-            print(f"[세트 {set_num + 1}] 방법2 결과 {method2_added}개 추가")
-        
-        # 2. 방법1 결과로 부족한 만큼 채우기 (최대 5개)
+                    total_m2 += 1
+        print(f"[세트 {set_num + 1}] 방법2 결과 {method2_added}개 추가")
+
+        # 2) 방법1로 세트 10개 될 때까지 보충(상한 5 제거)
+        method1_added = 0
         if method1_all_sets and set_num < len(method1_all_sets):
-            needed_count = 10 - len(set_items)  # 10개가 되도록 부족한 개수
-            method1_added = 0
-            
-            for product in method1_all_sets[set_num]:  # 해당 세트에서
-                if method1_added >= min(needed_count, 5):  # 최대 5개까지만
+            for product in method1_all_sets[set_num]:
+                if len(set_items) >= 10:
                     break
-                if product['상품코드'] not in used_codes:
+                code = norm(product.get('상품코드'))
+                if code and code not in used_codes:
                     set_items.append(product)
-                    used_codes.add(product['상품코드'])
+                    used_codes.add(code)
                     method1_added += 1
-            
-            print(f"[세트 {set_num + 1}] 방법1 결과 {method1_added}개 추가 (중복 제거 후)")
-        
-        # 3. 현재 세트를 final_results에 추가
+                    total_m1 += 1
+        print(f"[세트 {set_num + 1}] 방법1 결과 {method1_added}개 추가 (중복 제거 후)")
+
         final_results.extend(set_items)
         print(f"[세트 {set_num + 1}] 완성: {len(set_items)}개 (누적 총 {len(final_results)}개)")
 
-    print(f"\n[최종표시] 총 {len(final_results)}개 상품이 {len(final_results)//10}개 세트로 구성됨")
+    # ===== 최종 50개 미만이면 백필 =====
+    TARGET = 50
+    def flatten_unique(nested):
+        pool, seen = [], set()
+        for block in (nested or []):
+            for x in (block or []):
+                c = norm(x.get('상품코드'))
+                if not c or c in used_codes or c in seen:
+                    continue
+                pool.append(x)
+                seen.add(c)
+        return pool
+
+    if len(final_results) < TARGET:
+        remain = TARGET - len(final_results)
+        print(f"\n[백필] {remain}개 부족 → 추가 충전")
+
+        # 방법2 먼저 채우고 모자라면 방법1로
+        m2_pool = flatten_unique(method2_all_sets)
+        m1_pool = flatten_unique(method1_all_sets)
+
+        i = 0
+        while remain > 0 and i < len(m2_pool):
+            it = m2_pool[i]; i += 1
+            c = norm(it.get('상품코드'))
+            if c and c not in used_codes:
+                final_results.append(it); used_codes.add(c); total_m2 += 1; remain -= 1
+
+        j = 0
+        while remain > 0 and j < len(m1_pool):
+            it = m1_pool[j]; j += 1
+            c = norm(it.get('상품코드'))
+            if c and c not in used_codes:
+                final_results.append(it); used_codes.add(c); total_m1 += 1; remain -= 1
+
+        if remain > 0:
+            print("[경고] 후보 부족으로 50개를 못 채웠습니다.")
+
+    print(f"\n[최종표시] 총 {len(final_results)}개 (M2={total_m2}, M1={total_m1})")
+
     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     # LLM 메시지 생성용 텍스트 (방법2 우선 표시)
     products_text = "\n".join([
         f"- 코드: {p['상품코드']} | 제목: {p['제목']} | 가격: {p['가격']:,}원 | 카테고리: {p['카테고리']}"
@@ -2807,7 +3111,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     주어진 상품 목록을 바탕으로, 고객이 더 나은 선택을 할 수 있도록 도와주세요.
 
     [매우 중요]
-    - 특정 품목/모델로 단정하지 말고, 후보 리스트의 특징을 근거로 질문하세요.
 
     - 고객이 원하는 상품을 정확히 찾을 수 있도록, 후보 상품의 특징을 활용해 고객의 선호를 파악하는 질문을 작성하세요.
     - 현재 시즌: {season}
@@ -2815,29 +3118,20 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     후보 상품 목록:
     {products_text}
 
+    - 만약 고객이 "{preprocessed_query}"(을)를 찾고 있다면, 같은 상황에서 함께 고려할 수 있는 다른 상품(예: 비옷을 찾는다고 하면 비옷과 같은 레벨의 제품 우산,장화 등등 이런 제품은 어떤지 물어본다.)도 자연스럽게 “이런 상품도 있으니 어떠세요?” 식으로 한 문장으로 제안해 주세요. (단, 상품 리스트에는 포함하지 마세요.)
 
     요청사항:
-    1) 후보 상품의 제목/설명에서 서로를 구분해주는 특징 키워드 3~5개를 추출하세요.
-    - 기능/성능: 방수, 저소음, 고출력, 대용량, 저전력, 무선/유선, 규격(예: 27W, 128GB, 1.5L 등)
-    - 재질/마감: 가죽/스테인리스/TPU/친환경 등
-    - 구성/형태: 세트/단품, 접이식, 휴대용, 벽걸이, 2+1 구성 등
-    - 호환/범용/시즌: 정품/호환, 규격·사이즈, 여름/겨울 등
-    2) 그 특징을 활용해 고객 의도 확인과 선호 파악을 위한 '확인형 질문'을 반드시! 
-    3) 상품 코드나 구체 모델명/스펙 나열은 금지합니다. 후보에서 추출한 '특징 키워드'만 요약해 언급하세요.
-    4) 친근하면서도 전문적인 대화체를 유지하세요.
-    5) 아래 예시는 참고만 하며, 그대로 복사하지 말고 실제 후보의 특징으로 대체하세요.
+    1) 특징을 활용해 고객 의도 확인과 선호 파악을 위한 '확인형 질문'을 반드시! 
+    2) 상품 코드나 구체 모델명/스펙 나열은 금지합니다. 후보에서 추출한 '특징 키워드'만 요약해 언급하세요.
+    3) 친근하면서도 전문적인 대화체를 유지하세요.
 
-    답변 형식(단락 예시):
-    심플한 구성이 더 좋으실까요? 사용하실 환경과 선호 가격대(프리미엄/실속), 디자인·재질, 그리고 본품/관련품 중 어떤 쪽을 찾으시는지도 알려주시면 더 정확히 추천해 드리겠습니다.
-    
+
     **무조건 어떤 언어가 들어와도 {target_lang}로만 답변하세요**
     **무조건 답변은 한글은 200자 이내,영어는 230자 이내로 자세하게 작성하되 요약본으로 답변을 작성하세요.
 
     """
 
     print("target_lang->", target_lang)
-    # - 예시 어조: "후보를 보니 [특징A/특징B/특징C] 옵션이 보이는데, 이런 조건이 필요하신가요?"
-    # - 가격대(프리미엄/일반/실속), 디자인, 용도, 재질, 브랜드 선호, 계절감, 옵션 유무를 과도한 나열 없이 자연스럽게 묻으세요.
 
     # 2) 호출부 동일 (system에 실어 보내는 현재 구조 유지)
     response = client.chat.completions.create(
