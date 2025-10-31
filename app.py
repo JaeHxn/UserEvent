@@ -9,9 +9,10 @@ import base64
 import urllib
 from concurrent.futures import ThreadPoolExecutor
 import redis
+import uvicorn
 
 from langdetect import detect
-from collections import defaultdict, Counter
+from collections import deque
 # langchain 의존성을 선택적으로 import
 try:
     from langchain.retrievers.document_compressors import CrossEncoderReranker
@@ -39,7 +40,7 @@ import hmac
 import hashlib
 
 from fastapi import  Cookie, Depends, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse,PlainTextResponse, Response,FileResponse
 from langchain.schema import AIMessage, HumanMessage, SystemMessage
 from langchain_community.chat_message_histories import (
     ChatMessageHistory,
@@ -53,6 +54,8 @@ from typing import Optional, Union, List, Dict, Any, Tuple, Iterable
 from decimal import Decimal, InvalidOperation
 from rapidfuzz import fuzz
 
+##보안관련
+
 
 
 
@@ -60,6 +63,10 @@ executor = ThreadPoolExecutor()
 
 # 환경변수 로드
 load_dotenv()
+
+
+
+
 
 # ─── ENV & 유틸 (위쪽 공용 영역에 추가/교체) ─────────────────────────────
 
@@ -137,7 +144,134 @@ print(f"✅ Milvus에서 불러온 카테고리 개수: {len(categories)}")
 app = FastAPI(title="AI 상품 추천 시스템", version="1.0.0")
 templates = Environment(loader=FileSystemLoader("templates"))
 
-# Pydantic 모델 정의
+
+# 설정: 1분(60초)에 최대 60회 (원하면 환경변수로 바꿔도 됨)
+RATE_WINDOW_SECONDS = 120
+RATE_MAX_REQUESTS   = 10
+
+SOFT_BAN_SECONDS    = 5 * 60       # 5분
+HARD_BAN_SECONDS    = 2 * 60 * 60  # 2시간
+BAN_HARASS_THRESHOLD = 5           # 밴 중 n회 이상 두드리면 하드 밴
+
+
+SAFE_PREFIXES = (
+    "/robots.txt", "/favicon.ico",
+    "/docs", "/openapi.json", "/redoc",
+    "/static", "/assets", "/health", "/status"
+)
+WHITELIST_IPS = {}
+
+# ===== 상태 저장 =====
+_ip_hits       = {}       # dict[str, deque[float]]: 평시 슬라이딩 창
+_ip_ban_until  = {}       # dict[str, float]        : 밴 해제 시각(epoch)
+_ip_ban_tier   = {}       # dict[str, str]          : "soft" | "hard"
+_ip_ban_hits   = {}       # dict[str, deque[float]] : 밴 중 반복 타격 카운트
+
+# ===== 메시지 템플릿 (상황별 여러 개 → 랜덤 선택) =====
+MESSAGES = {
+    "soft_ban_start": "You're sending requests too quickly. Please try again in {minutes} minute(s).",
+    "soft_ban_still": "Temporary limit is active. Please try again in {remain} second(s).",
+    "hard_ban_start": "Repeated requests detected. Access is restricted for {hours} hour(s).",
+    "hard_ban_still": "Protection mode is active. Please try again in {remain} second(s).",
+    "rate_limit_hit": "Rate limit reached. Please try again shortly."
+}
+
+def _client_ip(req: Request) -> str:
+    # 프록시 없는 구조: X-Forwarded-For 신뢰 금지
+    return req.client.host or "unknown"
+
+def _starts_with_any(path: str, prefixes: tuple) -> bool:
+    return any(path.startswith(p) for p in prefixes)
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    path = request.url.path
+
+    # 예외 경로/화이트리스트 우선 통과
+    if _starts_with_any(path, SAFE_PREFIXES):
+        return await call_next(request)
+
+    ip = _client_ip(request)
+    if ip in WHITELIST_IPS:
+        return await call_next(request)
+
+    now = time.time()
+
+    # ===== 1) 밴 집행 & 에스컬레이션 =====
+    ban_until = _ip_ban_until.get(ip, 0.0)
+    if ban_until and now < ban_until:
+        # 밴 중 추가 요청 기록
+        dq = _ip_ban_hits.setdefault(ip, deque())
+        dq.append(now)
+
+        # 최근 SOFT_BAN_SECONDS 내 기록만 유지
+        cutoff_ban = now - SOFT_BAN_SECONDS
+        while dq and dq[0] < cutoff_ban:
+            dq.popleft()
+
+        # 소프트 밴 상태에서 반복 타격 → 하드 밴 승격
+        if _ip_ban_tier.get(ip) == "soft" and len(dq) >= BAN_HARASS_THRESHOLD:
+            _ip_ban_until[ip] = now + HARD_BAN_SECONDS
+            _ip_ban_tier[ip]  = "hard"
+            _ip_ban_hits[ip].clear()
+            return PlainTextResponse(
+                MESSAGES["hard_ban_start"].format(hours=int(HARD_BAN_SECONDS / 3600)),
+                status_code=429,
+                headers={"Retry-After": str(HARD_BAN_SECONDS)}
+            )
+
+        # 여전히 밴 중(소프트/하드 공통): 남은 시간 안내
+        remain = max(1, int(ban_until - now))
+        key = "hard_ban_still" if _ip_ban_tier.get(ip) == "hard" else "soft_ban_still"
+        return PlainTextResponse(
+            MESSAGES[key].format(remain=remain),
+            status_code=429,
+            headers={"Retry-After": str(remain)}
+        )
+
+    # 만료된 밴 정리
+    if ban_until and now >= ban_until:
+        _ip_ban_until.pop(ip, None)
+        _ip_ban_tier.pop(ip, None)
+        _ip_ban_hits.pop(ip, None)
+
+    # ===== 2) 평시 카운트 =====
+    q = _ip_hits.setdefault(ip, deque())
+    cutoff = now - RATE_WINDOW_SECONDS
+    while q and q[0] < cutoff:
+        q.popleft()
+
+    # ===== 3) 임계 초과 → 소프트 밴 발동 =====
+    if len(q) >= RATE_MAX_REQUESTS:
+        _ip_ban_until[ip] = now + SOFT_BAN_SECONDS
+        _ip_ban_tier[ip]  = "soft"
+        _ip_ban_hits[ip]  = deque([now])
+        return PlainTextResponse(
+            MESSAGES["soft_ban_start"].format(minutes=int(SOFT_BAN_SECONDS / 60)),
+            status_code=429,
+            headers={"Retry-After": str(SOFT_BAN_SECONDS)}
+        )
+
+    # 허용 → 기록 + 통과
+    q.append(now)
+    resp = await call_next(request)
+
+    # 429 표준화(다른 경로에서 429가 나와도)
+    if resp.status_code == 429 and "Retry-After" not in resp.headers:
+        resp.headers["Retry-After"] = "60"
+    return resp
+
+
+
+
+
+
+
+
+
+
+
+
 class ProductViewData(BaseModel):
     product_code: str
     product_data: dict
@@ -163,9 +297,6 @@ def clean_accumulated_query(parts: list) -> str:
             continue
         cleaned.append(s)
     return " ".join(cleaned)
-
-
-
 
 
 
@@ -299,6 +430,27 @@ async def logout():
     resp = RedirectResponse(url="/login", status_code=302)
     resp.delete_cookie(ADMIN_COOKIE_NAME)
     return resp
+
+
+##보안측면 추가 
+###################
+@app.get("/_whoami")
+async def whoami(req: Request):
+    return {
+        "client_host": req.client.host,
+        "x_forwarded_for": req.headers.get("x-forwarded-for"),
+        "user_agent": req.headers.get("user-agent"),
+    }
+
+
+
+
+
+
+
+
+
+
 
 # 요청 모델
 class QueryRequest(BaseModel):
@@ -501,11 +653,11 @@ class Ranker_DirectSearch:
 
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:
     # 🔧 재질문 임계값 통일 설정
-    THRESHOLD = 0.75             # 평균 점수 임계값 (이상이면 검색 진행)
-    DIRECT_MATCH_HIGH = 0.7      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
-    FACET_COVERAGE_MIN = 0.4     # 최소 속성 커버리지 (미달 시 재질문)
-    ATTRIBUTE_MIN = 0.4          # 속성 매칭 최소값
-    FACET_SUFFICIENT = 0.5       # 충분한 속성 커버리지
+    THRESHOLD = 0.6             # 평균 점수 임계값 (이상이면 검색 진행)
+    DIRECT_MATCH_HIGH = 0.5      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
+    FACET_COVERAGE_MIN = 0.35     # 최소 속성 커버리지 (미달 시 재질문)
+    ATTRIBUTE_MIN = 0.35          # 속성 매칭 최소값
+    FACET_SUFFICIENT = 0.45       # 충분한 속성 커버리지
 
 
     def check_session_timeout(session_history, session_id: str) -> dict:
@@ -607,31 +759,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         completion_percent = int(round(completion_ratio * 100))
         
         return completion_ratio, completion_percent
-
-    def format_completion_message(completion_percent: int, avg_score: float, threshold: float = THRESHOLD) -> str:
-        """
-        완성률에 따른 친절한 메시지 생성
-        
-        Args:
-            completion_percent: 완성률 퍼센트 (0~100)
-            avg_score: 평균 점수
-            threshold: 완성 기준 점수
-            
-        Returns:
-            str: 완성률 메시지
-        """
-        if completion_percent >= 100:
-            return f"💯{completion_percent}%"
-        elif completion_percent >= 80:
-            return f"🎯{completion_percent}%"
-        elif completion_percent >= 60:
-            return f"📈{completion_percent}%"
-        elif completion_percent >= 40:
-            return f"📊{completion_percent}%"
-        elif completion_percent >= 20:
-            return f"📉{completion_percent}%"
-        else:
-            return f"❓{completion_percent}%"
     
     collection = Collection(COLLECTION)   #다시 상품 DB 컬렉션으로 연결
     def convert_to_serializable(obj):
@@ -981,6 +1108,11 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
                 amount = int(m.group(1))
                 comp = m.group(2) if len(m.groups()) > 1 else None
+
+                # 단일 숫자가 1개(1, 2 등)일 때는 가격으로 인식하지 않음 (예: '1개', '2개' 등)
+                if amount in [1, 2]:
+                    print(f"[Debug] 단일 숫자({amount})는 가격으로 인식하지 않음")
+                    continue
 
                 # (A) 한글 연산자 우선 처리
                 if comp in op_map_kr:
@@ -1436,22 +1568,20 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     
     # --- LLM 프롬프트: 의도 파악 + 스마트 재질문 통합 (ui_message) ---
     INTENT_GATE_PROMPT = lambda user_query, recent_context: f"""
-    **AI 통합 분석 & 재질문 시스템**
-    다음 사용자 질의를 읽고 '의도 파악 신뢰도'를 평가하고 맞춤 재질문을 생성하세요.
-    출력은 반드시 JSON 한 덩어리만. 다른 문장/주석 금지.
+    - 모호한 질의를 '넓게 → 좁게' 퍼널로 재질문하여 **상품 자체 정보**(유형/용도/환경/규격/재질/호환 등)만 단계적으로 수집한다.
+    - 배송/수령/가격/할인 등 **구매조건 질문은 절대 금지**.
+    - 다음 사용자 질의를 읽고 '의도 파악 신뢰도'를 평가하고 맞춤 재질문을 생성하세요.
+    - 출력은 반드시 JSON 한 덩어리만. 다른 문장/주석 금지.
 
     [사용자 질의] {user_query}
     단답형으로 입력이 되면 LLM이 답변한 선택지에 답한거니 그걸 관련 대화를 이어가세요.
     [이전 대화 요약] {recent_context or '없음'}
 
-    ⚡ **0단계: 엄격한 자동 진행 규칙 (Strict Auto-Proceed)**
-    다음에 **정확히** 해당하는 경우만 재질문 없이 바로 진행하세요.
+    🔐 카테고리 잠금
+    - 질의로 유추한 1차 카테고리를 category_lock으로 잠그고, 해당 하위에서만 질문을 생성한다.
+    - 색상/스타일 등 범용 항목은 기본 질문에서 제외(필요 시 후순위 보조 단계에서만).
 
-    **🎯 절대 확실한 경우만 자동 진행:**
-    1. **완전한 브랜드+모델명**: "아이폰 15 프로", "갤럭시 S24", "RTX 4070"
-    2. **구체적 규격+제품**: "30인치 모니터", "256GB SSD", "1TB 외장하드"
-    3. **명확한 단일 상품 + 구매 의사**: "에어팟 구매", "맥북 최저가", "아이패드 찾아줘"
-
+    🧭 점수·라우팅
     **🚨 재질문이 필요한 경우들 (점수 낮게 부여):**
     - **모호한 카테고리**: "운동용품", "화장품", "전자제품" → direct_match=0.2
     - **형용사만 있는 경우**: "좋은", "저렴한", "예쁜" → direct_match=0.1
@@ -1464,112 +1594,35 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - **attribute_match**: 용도/재질/크기/브랜드 중 2개 이상 명시되어야 0.5 이상
     - **context_match**: 명확한 구매 의사가 있어야 0.6 이상
     - **총 avg_score ≥ 0.7**: 매우 엄격하게 적용
+    - **확정 상품 속성 ≥ 3개** 확보 시 route="proceed", 아니면 "clarify".
 
-    🔒 **현재 탐색 카테고리(잠금)**
-    - 질의에서 드러난 1차 카테고리를 잠급니다.
-    - 이 카테고리 **외부로 전환 금지**. 하위 유형/속성 안에서만 질문·선택지를 구성하세요.
+    🧪 퍼널 단계(상품 정보만)
+    - Stage1: 하위 유형/사용 시나리오 (예: 난방기 → 팬히터 / 세라믹 / 오일히터 / 전기패널)
+    - Stage2: 사용 환경 제약(설치/공간/전원/소음/내구/방수 등) — *구매조건 제외*
+    - Stage3: 핵심 스펙 우선순위(출력/효율/크기/무게/모듈/확장/호환 등) — *숫자 유도 금지*
+    - Stage4(선택): 재질/구조/브랜드 고정 여부 — *가격·배송 금지*
 
-    📋 **미션: 핵심 정보만 수집하여 검색 품질 극대화**
+    ✍️ 선택지 스타일 가드(강제)
+    1) 숫자·단위·기호 금지(0–9, %, dB, mm, W, +/-, /, ~, ≥, ≤ 등)
+    2) 괄호 금지(() []  등)
+    3) 설명어·부사 금지(예: “강력”, “빠르게”, “가열 빨라요”)
+    4) 길이 1~3단어 **명사/구**만(예: “팬히터”, “저소음”, “방수”)
+    5) 옵션 수 A–D(최대 E). 배송/금액/할인/수령 관련 단어 **금지**.
 
-    🔍 **1단계: 이미 확정된 정보 파악**
-    이전 대화에서 사용자가 이미 선택하거나 명시한 정보들을 정확히 파악하세요.
-    ⚠️ **절대 금지**: 이미 확정된 정보를 다시 묻는 것!
+    🧩 언어
+    - 사용 언어를 감지하되, 결과는 반드시 {target_lang}로만 출력한다.
 
-    🌟 **2단계: 용어/동의어 확장**
-    외국어/브랜드/생소어 존재 시 한국 리테일 검색어로 확장.
+    🧠 clarify_question 작성 규칙
+    - 한 문장 질문 + 같은 줄에 **A) … B) … C) … D) … ** 형태로 **상품 관련 선택지**를 배치한다.
+    - 필요 시 정보성 질의라면, 먼저 한 줄 정의를 간단히 제시한 뒤 다음 줄에 선택지 질문을 배치한다.
+    - 선택지에는 숫자·단위·괄호·부사 설명을 넣지 않는다.
 
-    확장 예시:
-    - "프릭남쁠라" → "매운 칠리소스, 태국 핫소스, 스리라차, 고추소스, 매콤한 소스"
-    - "타바스코" → "핫소스, 매운소스, 칠리소스, 고추소스"  
-    - "삼발올렉" → "인도네시아 칠리소스, 매운 디핑소스, 아시아 핫소스"
-    - "우산" → "우산, 양산, 접이식우산, 장우산, 자동우산, 방수우산"
-    
-    🏷️ **브랜드 확장 역할 (중요!):**
-    사용자가 "브랜드 운동화", "브랜드 신발", "유명한 브랜드", "명품 브랜드" 등을 언급하면:
-    
-    **당신의 역할**: 해당 카테고리에서 가장 잘 알려진 대표 브랜드 3-5개를 자동으로 선정하여 expanded_terms에 포함시키세요.
-    
-    **브랜드 선정 기준**:
-    - 한국 시장에서 인지도가 높은 브랜드 우선
-    - 해당 카테고리의 대표적인 글로벌 브랜드
-    - 온라인 쇼핑몰에서 쉽게 찾을 수 있는 브랜드
-    - 다양한 가격대를 아우르는 브랜드 (고급/중급/보급)
-    
-    **자동 추론 예시**:
-    - "브랜드 운동화" → 운동화 분야 대표 브랜드들을 스스로 선정
-    - "명품 가방" → 럭셔리 가방 브랜드들을 스스로 선정  
-    - "브랜드 화장품" → 유명 화장품 브랜드들을 스스로 선정
-    - "브랜드 시계" → 시계 브랜드들을 스스로 선정
-    
-    **주의사항**: 리스트를 암기하지 말고, 상황에 맞는 브랜드를 유연하게 추론하세요.
-    
-    🔍 **일반 확장 역할**:
-    사용자가 추상적이거나 모호한 표현을 사용할 때도 구체적인 검색어로 확장하세요:
-    
-    **예시 상황별 확장 방법**:
-    - "겨울 아이템" → 겨울에 필요한 구체적인 상품들로 확장
-    - "운동용품" → 다양한 운동 관련 구체적 용품들로 확장  
-    - "건강식품" → 실제 건강식품 카테고리들로 확장
-    - "생활용품" → 일상생활 필수 아이템들로 확장
-    - "패션 아이템" → 구체적인 의류/악세서리 종류들로 확장
-    
-    **확장 원칙**: 
-    1. 사용자 의도를 정확히 파악하고
-    2. 해당 카테고리의 대표적인 하위 개념들을 3-6개 선정
-    3. 검색에 실제로 도움이 되는 구체적인 키워드로 변환
-
-
-    **3단계: 점수 평가**
-    direct_match (60%), attribute_match (20%), brand_match (10%), context_match (10%)
-
-    **특별 점수 처리:**
-    - "우산/모자/가방" 등등 명확한 일상 상품명의 문맥 파악 문장 → direct_match=0.8
-    - "있나?/찾아줘/알려줘" 같은 직접 요청같은 문맥의 문장 → context_match=0.7
-
-    **4단계: 점수상승 지향 재질문 설계**
-    재질문은 아래 4점수를 올리기 위한 목적이어야 함:
-    - direct_match: 구체 명사/규격(타입, 치수, 형태) 확정
-    - attribute_match: 용도/무게/재질/기능/가격대 등 이런 타입 2~3개 선택 유도
-    - brand_match: 브랜드 지정 vs 무관 토글
-    - context_match: 직전/누적쿼리 자세히 요약 후 확인
-
-    **재질문 품질 규칙 - 정보 풍부화 원칙**
-    - **상품별 핵심 정보 제공**: 각 선택지마다 주요 특징, 용도, 가격대, 적합한 상황 등 구매 결정에 필요한 구체적 정보 포함
-    - **비교 기준 명시**: 크기, 재질, 기능, 브랜드, 가격대 등 실제 비교할 수 있는 기준 제시
-    - **사용 시나리오**: 언제, 어디서, 누가 사용하는지에 간결히
-    - **성능/품질 차이**: 고급형 vs 보급형, 전문용 vs 일반용 등의 차이 설명
-    - 한 문단+선택지 이모지 A~D (의미 중복/모호어 금지)
-
-    - **선택지 앞의 한 문단 설명에서** 사용자가 "{user_query}"(을)를 찾고 있을 때, 같은 상황에서 함께 고려할 수 있는 다른 상품(예: 우산이면 비옷, 장화 등)도 자연스럽게 "이런 대안도 있으니 어떠신가요?" 식으로 제안하는 문장을 반드시 포함하세요.  
-    - 단, 선택지(A~D)에는 이런 대안 상품을 직접 포함하지 마세요.  
-    - 이 문장은 선택지 바로 앞에 위치해야 하며, 너무 길지 않게 간결하게 작성하세요.
-    
-    **역할 중재(Explain-or-Search, 암묵 추론)**
-
-    - 지배적 의도가 **설명/정의/차이/의미 질문**(예: "~가 뭐야", "~차이", "~뜻?")이면:
-    1) {target_lang}로 **한 줄 정의(170자 내외)**를 먼저 제시하고,
-
-    2) 즉시 이어서 **짧은 선택지형 브릿지 질문(A~D)**로 구매 탐색으로 연결한다.
-
-    3) 이 두 줄을 **clarify_question**에 넣고, 기본적으로 **route="clarify"**로 둔다.
-        (단, 질의 안에 **명시적 구매 의사**와 **구체 항목**이 함께 있으면 route="proceed" 가능)
-
-    4) **expanded_terms**에는 실제 검색에 유용한 3~6개 키워드를 넣는다(동의어/유사 스타일/연관 카테고리).
-    - 예시(형식 참고용):
-    clarify_question:
-
-
-
-    **정보성 질의에도 적용되는 재질문 가이드(모든 카테고리 공통):**
-    - 제공되는 문장을 잘 읽어보고 판단해서 문맥에 어울리는 답변을 제대로 답변.
-    - 과장/마켓팅 문구 금지. 구체 키워드만.
-        
-    🌍 **언어 매칭 규칙:**
-    **사용자가 사용한 언어를 감지하고, 그 나라 언어로 답변하세요!!**
-
-    **무조건 어떤 언어가 들어와도 {target_lang}로만 답변하세요!반드시**
-
-    답변 언어는 무조건 {target_lang}로만 작성해주세요. 다른 언어, 혼합 표현 절대 금지.
+    예시(출력에 포함 금지):
+    - 난방기 Stage1: A) 팬히터  B) 세라믹  C) 오일히터  D) 전기패널
+    - 러닝화 Stage1: A) 도로  B) 트레일  C) 실내  D) 장거리
+    - 모니터 Stage1: A) FHD  B) QHD  C) UHD  D) 울트라와이드
+    - SSD Stage1: A) NVMe  B) SATA  C) 내장  D) 외장
+    - 청소기 Stage1: A) 스틱  B) 로봇  C) 유선  D) 핸디
     
 
     JSON 스키마:
@@ -1582,11 +1635,17 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     "route": "clarify",
     "clarify_question": "한 줄 정의 + 한 줄 선택지 질문(또는 순수 선택지 질문)",
     "expanded_terms": ["검색에 유용한 한국어 키워드 3~6개"],
-    "refine_terms": ["보강 키워드/사이즈확장 결과"],
     "notes": ["판단 근거(간단히)"]
 
     }}
     """
+
+
+
+
+
+
+    
 
     def run_intent_gate(user_query: str, session_history, client, model=LLM_MODEL):
         # 🚀 바로검색 명령어 확인 - 재질문 패스
@@ -1597,7 +1656,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 "attribute_match": 0.7, "brand_match": 0.6,
                 "avg_score": 0.85, "route": "proceed",
                 "clarify_question": "",
-                "refine_terms": ["direct_search"],
                 "notes": ["direct_search_command"],
                 "completion_ratio": 1.0,
                 "completion_percent": 100,
@@ -1637,8 +1695,31 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     "attribute_match": 0.0, "brand_match": 0.0,
                     "avg_score": 0.0, "route": "clarify",
                     "clarify_question": "",
-                    "refine_terms": [], "notes": ["parse_fail"]
                 }
+
+        # expanded_terms 프린트 출력
+        if "expanded_terms" in intent_eval:
+            print(f"[LLM] expanded_terms: {intent_eval['expanded_terms']}")
+
+        # 안내 문구를 언어에 따라 다르게 설정
+        notice_ko = "        ※ 선택지에 없는 경우 자유롭게 글로 서술해서 입력하셔도 됩니다."
+        notice_en = "        ※ If none of the choices fit, feel free to write your answer in your own words."
+
+        # target_lang은 이미 위에서 결정됨
+        if target_lang == "한국어":
+            notice = notice_ko
+        else:
+            notice = notice_en
+
+        if intent_eval.get("clarify_question"):
+            intent_eval["clarify_question"] = intent_eval["clarify_question"].strip()
+            if notice not in intent_eval["clarify_question"]:
+                intent_eval["clarify_question"] += f"\n{notice}"
+
+
+
+
+
 
         # 4) 서버에서 재계산(단일 진실원칙)
         avg_score, route = _recompute_route(intent_eval)
@@ -1647,7 +1728,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
         # 🎯 완성률 계산 및 추가
         completion_ratio, completion_percent = calculate_completion_rate(avg_score, THRESHOLD)
-        completion_message = format_completion_message(completion_percent, avg_score, THRESHOLD)
         
         # 🧠 **통합 완료** - INTENT_GATE_PROMPT에서 이미 재질문이 생성됨
         # intent_eval["clarify_question"]에 AI가 생성한 스마트 재질문이 이미 포함되어 있음
@@ -1655,12 +1735,12 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         intent_eval.update({
             "completion_ratio": completion_ratio,
             "completion_percent": completion_percent,
-            "completion_message": completion_message,
+            # "completion_message": completion_message,
             "context_analysis": context_analysis,
             "_raw_llm": raw,  # 👈 원문 JSON 그대로 보관
         })
 
-        print(f"[완성률] avg_score={avg_score:.3f} → {completion_message}")
+        # print(f"[완성률] avg_score={avg_score:.3f} → {completion_message}")
 
         # 5) 디버그(원하면 남기되, recent_context엔 안 넣도록 태그 유지)
         session_history.add_ai_message(f"[INTENT_GATE]{json.dumps(intent_eval, ensure_ascii=False)}")
@@ -1736,38 +1816,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     # ===== Intent Gate 실행 및 게이트 판정 =====
     intent_eval = run_intent_gate(query, session_history, client, model=LLM_MODEL)
     avg_score = float(intent_eval.get("avg_score", 0.0))
@@ -1783,6 +1831,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     clarification_count = 0
     user_query_parts = []
     
+
+    def sanitize_user_fragment(text: str) -> str:
+        t = (text or "").strip()
+        # 자주 나오는 동사형 불용어만 제거 (단어 경계 고려)
+        t = re.sub(r'(찾아\s*줘|찾아줘|찾아|알려줘|추천해줘)\b', '', t)
+        # 다중 공백 정리
+        t = re.sub(r'\s{2,}', ' ', t)
+        return t.strip()
+
     # 세션 히스토리에서 재질문 횟수와 사용자 질문들 수집
     try:
         print(f"[디버그] 전체 메시지 수: {len(session_history.messages)}")
@@ -1810,13 +1867,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-
-
-
             # 🔍 사용자 메시지 수집 (INTENT_GATE 태그 제외)
             elif hasattr(msg, 'type') and msg.type == 'human':
                 if "[INTENT_GATE]" not in content and content.strip():
-                    clean_content = content.strip().replace("찾아줘", "").replace("찾아", "").replace("을", "").replace("를", "").strip()
+                    clean_content = sanitize_user_fragment(content)
                     if clean_content and len(clean_content) < 50:
                         user_query_parts.append(clean_content)
                         print(f"[사용자 질문 수집] '{clean_content}'")
@@ -1893,29 +1947,26 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     
                     # 재질문 생성
                     followup = intent_eval.get("clarify_question")
-                    completion_message = intent_eval.get("completion_message", f"💡{intent_eval.get('completion_percent', 0)}%")
-                    enhanced = f"{followup}\n\n{completion_message}"
-                    
+                    enhanced = followup  # 완성률 메시지 없이 질문만
+
                     return {
                         "query": combined_query,  # 누적 쿼리로 저장
-                        "assistant_message": enhanced,      # 👈 프론트가 우선 사용
-                        "UserMessage": enhanced,            # 기존 호환
+                        "assistant_message": enhanced,      
+                        "UserMessage": enhanced,            
                         "RawContext": [m.content for m in session_history.messages],
                         "results": [],
-                        "combined_message_text": enhanced,  # 기존 호환
+                        "combined_message_text": enhanced,  
                         "intent_gate": intent_eval,
                         "needs_clarification": True,
                         "completion_percent": intent_eval.get("completion_percent", 0),
-                        "completion_message": completion_message,
                         "clarification_count": clarification_count + 1,
                         "accumulated_query": combined_query
                     }
             else:
                 # 다른 재질문 조건들
                 followup = intent_eval.get("clarify_question")
-                completion_message = intent_eval.get("completion_message", f"💡{intent_eval.get('completion_percent', 0)}%")
-                enhanced = f"{followup}\n\n{completion_message}"
-                
+                enhanced = followup  # 완성률 메시지 없이 질문만
+
                 return {
                     "query": combined_query,  # 누적 쿼리로 저장
                     "assistant_message": enhanced,      # 👈 프론트가 우선 사용
@@ -1926,7 +1977,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     "intent_gate": intent_eval,
                     "needs_clarification": True,
                     "completion_percent": intent_eval.get("completion_percent", 0),
-                    "completion_message": completion_message,
                     "clarification_count": clarification_count + 1,
                     "accumulated_query": combined_query
                 }
@@ -1946,12 +1996,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 f"A={intent_eval.get('attribute_match')} B={intent_eval.get('brand_match')}")
             if route != "proceed" and avg_score < THRESHOLD:
                 # 🎯 완성률 정보 포함된 재질문 생성
-                followup = intent_eval.get("clarify_question") or "조금만 더 구체화해주실래요? (용도/예산/브랜드 중 하나)"
-                completion_message = intent_eval.get("completion_message", f"💡 질문 완성률: {intent_eval.get('completion_percent', 0)}%")
-                
-                # 재질문에 완성률 정보 추가
-                enhanced = f"{followup}\n\n{completion_message}"
-                
+                followup = intent_eval.get("clarify_question") or "조금만 더 구체화해주실래요?"
+    
+                enhanced = followup  # 완성률 메시지 없이 질문만
                 return {
                     "query": query,
                     "UserMessage": enhanced,
@@ -1961,7 +2008,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     "intent_gate": intent_eval,
                     "needs_clarification": True,
                     "completion_percent": intent_eval.get("completion_percent", 0),
-                    "completion_message": completion_message
+                    # "completion_message": completion_message
                 }
 
 
@@ -1981,14 +2028,14 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     system_prompt = (
         f"""System:
-            당신은 (1) 검색 엔진 전처리 AI이자, (2) 쇼핑몰 검색·분류 전문가이며, (3) doc2query 생성기입니다.
+            당신은 (1) 검색 엔진의 전처리를 담당하는 AI이자, (2) 물건을 추천해주는 전문가입니다.
             입력 언어가 무엇이든 먼저 한국어로 의미 보존 번역을 수행합니다.
             
             
             [🔥 대화 맥락 강제 반영 원칙 - 절대 준수!]
             1. 이전 대화 이력:
             {conversation_context}
-            
+             
             2. 🚨 맥락 반영 강제 규칙 (반드시 실행):
             **STEP 1: 맥락 분석**
             - 이전 대화에서 상품명 추출: 예) "겨울장갑", "여름가방", "운동화" 등
@@ -1999,9 +2046,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             - 현재 입력이 조건/속성 추가인가? YES/NO
             
             **STEP 3: 강제 결합 (반드시 실행!)**
-            ✅ 현재 입력에 상품명 없고 + 이전에 상품명 있음 → **[이전 상품명] + [현재 조건]**
-            ✅ 현재 입력이 조건 추가임 → **[이전 상품명] + [이전 조건들] + [현재 조건]**
-            ✅ 예시:
+             - 현재 입력에 상품명 없고 + 이전에 상품명 있음 → **[이전 상품명] + [현재 조건]**
+             - 현재 입력이 조건 추가임 → **[이전 상품명] + [이전 조건들] + [현재 조건]**
+             - 예시:
                - 이전: "겨울장갑" → 현재: "국내산" → **결과: "겨울장갑 국내산"**
                - 이전: "여름가방" → 현재: "작은거" → **결과: "여름가방 작은"**
                - 이전: "겨울장갑 국내산" → 현재: "저렴한" → **결과: "겨울장갑 국내산 저렴한"**
@@ -2011,40 +2058,22 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
  
             [전처리 원칙]
-            1) 사용자가 모호한 상위개념으로 묻는 경우(예: 한국식 과자, 여름 원피스, 세차용품):
-            - 카테고리/유형/대표 상품명으로 확장하되 3~7개 '핵심 하위유형/동의어'만 엄선 (오버확장 금지).
-            - 브랜드/스펙/색/규격/수량/가격 등 명시 제약은 보존.
-            - '추천/최고/인기' 등 검색 무의미 수식어 제거, 실효 토큰만 남김.
-            2) 한국 쇼핑 맥락의 일반명은 단수 표면형 우선(조사/어미·'용' 꼬리표 제거).
-            3) 불필요한 구두점 제거. OR/|/콤마 대신 공백 나열.
-            4) **부정/제외 처리(아주 중요)**:
+            1) 문장을 이해해서 분석하여 사용자가 찾고자 하는 상품의 모호한 상위개념으로 묻는 경우(예: "한국식 과자", "여름 원피스", "세차용품") → 
+            카테고리/유형/대표 상품명으로 확장된 표면어 다발을 만든다.
+            *사용자의 문장을 이해해서 추측 반드시 해본다! 질문에 대해서 답을 같이 생성해서 제일 앞에 단어를 붙인다.*
+
+            - 브랜드/스펙/색/규격/수량/가격 등 명시 제약이 있으면 보존.
+            - "추천/최고/인기" 같은 수식어는 제거하고, 실제 검색에 유의미한 토큰만 남긴다.
+            2) 한국 쇼핑 맥락의 일반명은 단수 표면형을 우선(복수/어미/조사 제거).
+            3) '용' 같은 불용미사/꼬리표는 제거.
+            4) 불필요한 구두점은 제거. OR, |, 콤마 대신 **공백 나열**만 사용.
+            5) **부정/제외 처리(아주 중요)**:
             - 다음 패턴을 부정 신호로 인식한다: "싫어/싫다/말고/빼고/제외(하고/한)/아닌/제외해줘/빼줘/미포함/제외 부탁" 등.
             - "A 말고 B", "A는 싫고 B", "B 찾는데 A 제외" 형태에서는 **A는 제외(-A), B는 유지**한다.
             - 제외 토큰은 단어·구를 **표준형으로 정규화**하고 **하이픈(-토큰)** 으로 표기한다(예: -호박맛, -딸기, -화이트).
             - 다단 제외가 있으면 공백으로 나열한다: 예) "사과 주스 -호박맛 -배맛".
             - 핵심 품목이 불명확하고 제외만 존재할 경우, **추정하지 말고 원문 유지**(의미 보존 원칙).
-
-            [doc2query: “사람이 검색할 법한 질의” — 관련/대체/보완 상품만]
-                - 목적: 메인 품목의 변형·동의어는 제외하고, 같은 레벨의 대체·보완·연계 품목만 추천 질의로 생성.
-                - 생성 개수: 8~12개.
-                - 언어: 사용자의 언어 우선. 한국 쇼핑 맥락에 자연스러운 표현 사용.
-                - 길이: 4~28자(공백 포함).
-
-                [허용 대상(반드시 이 범위로만 생성)]
-                - 형제 카테고리의 대체 품목(상위 카테고리 동일)
-                - 보완재/액세서리/소모품/설치부품/세트 구성품
-                - 상·하위 연계 시스템(입·출력 장치, 게이트웨이, 관리 단말 등)
-
-                [금지 규칙(엄격)]
-                - 메인 품목의 동의어/속성 변형/복수형/철자 변형 **전부 금지**
-                - 메인 품목 명칭이 질의에 **포함되면 안 됨**
-                - 브랜드/모델/규격 지어내기 금지(원문·맥락에 없는 고유명사 추정 금지)
-                - 부정/제외가 있으면 해당 대상 포함 질의 생성 금지
-                - 조사/어미만 바뀐 중복 변형 제거
-
-                [품질 기준]
-                - 실제로 함께 많이 구매·설치되는 항목을 우선(액세서리/소모품/설치 키트/연계 장비)
-                - 가능하면 규격·용도·장소 등 핵심 속성을 간결히 반영
+a
 
 
             [Category Search Text:카테고리 검색용 상품 요약 문장 생성]
@@ -2052,7 +2081,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 
                 **요구사항:**
                 1) 길이: 8~16자(공백 포함, 가능하면 12자 내외)
-                2) 관형어 1개 이상 포함: 예) 먹는/쓰는/입는/바르는/메는/신는/쓰는(착용)
+                2) 관형어 1개 이상 포함: 예) 먹는/쓰는/입는/바르는/메는/신는/쓰는(착용) 등등 문장과 자연스럽게
                 3) 브랜드/트렌드/마케팅 단어 금지: “다양한, 트렌드, 제품, 합리적, 프리미엄, 스타일리시, 최적”
                 4) 불필요한 종결어미, 존댓말 생략: “~합니다/입니다” → 생략
                 5) 핵심 품목 불명확 시: **추정 금지, 원문 유지**
@@ -2074,8 +2103,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             Raw Query: "<query>"
             Preprocessed Query: "<전처리된_쿼리(핵심 품목 + 유의미 속성만, ‘용’ 제거 후 표준형)>"
             Category Search Text: "<상품을_완전한_문장으로_설명하는_자연스러운_한국어_문장>"
-            Doc2Query: "<q1> | <q2> | <q3> | <q4> | <q5> | <q6>"
-
         """    
     )
 
@@ -2182,158 +2209,162 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             print(f"[Error] Category Search Text 추출 오류: {e}")
             return ""
     
-    def extract_doc2query(llm_text: str, min_len: int = 4, max_len: int = 28):
-
-
-        def _split_pipes(s: str):
-            return [x.strip() for x in s.split("|") if isinstance(x, str) and x.strip()]
-
-        def _norm_key(s: str):
-            return re.sub(r"\s+", " ", s.lower()).strip()
-
-        # 0) 원본 보존 + 선처리
-        text = (llm_text or "").strip()
-
-        # 1) JSON 우선 파싱 (코드펜스/앞뒤 잡음 제거 + 중괄호 블록만 추출)
-        try:
-            _t = text
-            if _t.startswith("```"):
-                _t = _t.strip("` \n")
-                if _t.lower().startswith("json"):
-                    _t = _t[len("json"):].lstrip()
-            i, j = _t.find("{"), _t.rfind("}")
-            if i != -1 and j != -1 and j > i:
-                _t = _t[i:j+1]
-            obj = json.loads(_t)
-            if "Doc2Query" in obj:
-                dq = obj["Doc2Query"]
-                if isinstance(dq, list):
-                    raw = [str(x).strip() for x in dq if str(x).strip()]
-                elif isinstance(dq, str):
-                    raw = _split_pipes(dq)
-                else:
-                    raw = []
-                # 정제
-                seen, out = set(), []
-                for q in raw:
-                    if len(q) < min_len or len(q) > max_len:
-                        continue
-                    k = _norm_key(q)
-                    if k in seen:
-                        continue
-                    seen.add(k)
-                    out.append(q)
-                return out
-        except Exception:
-            pass
-
-        # 2) 라벨 기반 추출: Doc2Query: "q1 | q2 | q3"
-        m = re.search(r'^\s*Doc2Query\s*:\s*["“]?(.+?)["”]?\s*$', text, re.M | re.I)
-        if m:
-            raw = _split_pipes(m.group(1))
-            seen, out = set(), []
-            for q in raw:
-                if len(q) < min_len or len(q) > max_len:
-                    continue
-                k = _norm_key(q)
-                if k in seen:
-                    continue
-                seen.add(k)
-                out.append(q)
-            return out
-
-        # 3) 폴백: 파이프 구분 라인 자동 감지 (Doc2Query 라벨이 없어도)
-
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        candidate = ""
-        for ln in lines:
-            if "|" in ln:
-                parts = _split_pipes(ln)
-                if len(parts) >= 2 and len(ln) <= 400:
-                    candidate = ln
-                    break
-        if candidate:
-            raw = _split_pipes(candidate)
-            seen, out = set(), []
-            for q in raw:
-                if len(q) < min_len or len(q) > max_len:
-                    continue
-                k = _norm_key(q)
-                if k in seen:
-                    continue
-                seen.add(k)
-                out.append(q)
-            return out
-
-        # 4) 최종 빈 리스트
-        return []
-    # ===================== Helper: Doc2Query를 Preprocessed에 병합 검색 단어 증강 =====================
-    def merge_doc2_into_preprocessed(pre_q: str, doc2_list, k: int = 5, max_len: int = 120) -> str:
-        """
-        Preprocessed Query 뒤에 Doc2Query 상위 k개를 공백으로 이어붙여 합친다.
-        - 부정(-토큰) 충돌 질의 제외
-        - 중복/공백 정리
-        - 최종 길이 제한
-        """
-        if not isinstance(pre_q, str):
-            pre_q = str(pre_q or "")
-        doc2_list = doc2_list or []
-
-        # 부정 토큰 수집 (-화이트, -XL 등)
-        minus_terms = {t[1:].strip() for t in pre_q.split() if t.startswith("-") and len(t) > 1}
-
-        def _clean(s: str) -> str:
-            s = (s or "").strip()
-            s = s.replace("|", " ").replace("\"", " ").replace("“", " ").replace("”", " ")
-            s = s.replace("’", "'").replace("‘", "'")
-            s = " ".join(s.split())
-            return s
-
-        picked = []
-        for q in doc2_list:
-            if len(picked) >= k:
-                break
-            cq = _clean(q)
-            if not cq:
-                continue
-            if len(cq) < 2 or len(cq) > 28:
-                continue
-            # 부정 토큰 충돌 제외
-            if any(mt and (mt in cq) for mt in minus_terms):
-                continue
-            # 중복 제거(공백 무시)
-            if any(cq == p or cq.replace(" ", "") == p.replace(" ", "") for p in picked):
-                continue
-            picked.append(cq)
-
-        tail = " ".join(picked).strip()
-        merged = (pre_q + " " + tail).strip() if tail else pre_q
-
-        if len(merged) > max_len:
-            parts = merged.split()
-            cut, cur = [], 0
-            for w in parts:
-                add = len(w) + (1 if cur > 0 else 0)
-                if cur + add > max_len:
-                    break
-                cut.append(w)
-                cur += add
-            merged = " ".join(cut).strip()
-        return merged
 
 
 
+# #####증강 부분#####
+#     def extract_doc2query(llm_text: str, min_len: int = 4, max_len: int = 28):
+
+
+#         def _split_pipes(s: str):
+#             return [x.strip() for x in s.split("|") if isinstance(x, str) and x.strip()]
+
+#         def _norm_key(s: str):
+#             return re.sub(r"\s+", " ", s.lower()).strip()
+
+#         # 0) 원본 보존 + 선처리
+#         text = (llm_text or "").strip()
+
+#         # 1) JSON 우선 파싱 (코드펜스/앞뒤 잡음 제거 + 중괄호 블록만 추출)
+#         try:
+#             _t = text
+#             if _t.startswith("```"):
+#                 _t = _t.strip("` \n")
+#                 if _t.lower().startswith("json"):
+#                     _t = _t[len("json"):].lstrip()
+#             i, j = _t.find("{"), _t.rfind("}")
+#             if i != -1 and j != -1 and j > i:
+#                 _t = _t[i:j+1]
+#             obj = json.loads(_t)
+#             if "Doc2Query" in obj:
+#                 dq = obj["Doc2Query"]
+#                 if isinstance(dq, list):
+#                     raw = [str(x).strip() for x in dq if str(x).strip()]
+#                 elif isinstance(dq, str):
+#                     raw = _split_pipes(dq)
+#                 else:
+#                     raw = []
+#                 # 정제
+#                 seen, out = set(), []
+#                 for q in raw:
+#                     if len(q) < min_len or len(q) > max_len:
+#                         continue
+#                     k = _norm_key(q)
+#                     if k in seen:
+#                         continue
+#                     seen.add(k)
+#                     out.append(q)
+#                 return out
+#         except Exception:
+#             pass
+
+#         # 2) 라벨 기반 추출: Doc2Query: "q1 | q2 | q3"
+#         m = re.search(r'^\s*Doc2Query\s*:\s*["“]?(.+?)["”]?\s*$', text, re.M | re.I)
+#         if m:
+#             raw = _split_pipes(m.group(1))
+#             seen, out = set(), []
+#             for q in raw:
+#                 if len(q) < min_len or len(q) > max_len:
+#                     continue
+#                 k = _norm_key(q)
+#                 if k in seen:
+#                     continue
+#                 seen.add(k)
+#                 out.append(q)
+#             return out
+
+#         # 3) 폴백: 파이프 구분 라인 자동 감지 (Doc2Query 라벨이 없어도)
+
+#         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+#         candidate = ""
+#         for ln in lines:
+#             if "|" in ln:
+#                 parts = _split_pipes(ln)
+#                 if len(parts) >= 2 and len(ln) <= 400:
+#                     candidate = ln
+#                     break
+#         if candidate:
+#             raw = _split_pipes(candidate)
+#             seen, out = set(), []
+#             for q in raw:
+#                 if len(q) < min_len or len(q) > max_len:
+#                     continue
+#                 k = _norm_key(q)
+#                 if k in seen:
+#                     continue
+#                 seen.add(k)
+#                 out.append(q)
+#             return out
+
+#         # 4) 최종 빈 리스트
+#         return []
+#     # ===================== Helper: Doc2Query를 Preprocessed에 병합 검색 단어 증강 =====================
+#     def merge_doc2_into_preprocessed(pre_q: str, doc2_list, k: int = 2, max_len: int = 120) -> str:
+#         """
+#         Preprocessed Query 뒤에 Doc2Query 상위 k개를 공백으로 이어붙여 합친다.
+#         - 부정(-토큰) 충돌 질의 제외
+#         - 중복/공백 정리
+#         - 최종 길이 제한
+#         """
+#         if not isinstance(pre_q, str):
+#             pre_q = str(pre_q or "")
+#         doc2_list = doc2_list or []
+
+#         # 부정 토큰 수집 (-화이트, -XL 등)
+#         minus_terms = {t[1:].strip() for t in pre_q.split() if t.startswith("-") and len(t) > 1}
+
+#         def _clean(s: str) -> str:
+#             s = (s or "").strip()
+#             s = s.replace("|", " ").replace("\"", " ").replace("“", " ").replace("”", " ")
+#             s = s.replace("’", "'").replace("‘", "'")
+#             s = " ".join(s.split())
+#             return s
+
+#         picked = []
+#         for q in doc2_list:
+#             if len(picked) >= k:
+#                 break
+#             cq = _clean(q)
+#             if not cq:
+#                 continue
+#             if len(cq) < 2 or len(cq) > 28:
+#                 continue
+#             # 부정 토큰 충돌 제외
+#             if any(mt and (mt in cq) for mt in minus_terms):
+#                 continue
+#             # 중복 제거(공백 무시)
+#             if any(cq == p or cq.replace(" ", "") == p.replace(" ", "") for p in picked):
+#                 continue
+#             picked.append(cq)
+
+#         tail = " ".join(picked).strip()
+#         merged = (pre_q + " " + tail).strip() if tail else pre_q
+
+#         if len(merged) > max_len:
+#             parts = merged.split()
+#             cut, cur = [], 0
+#             for w in parts:
+#                 add = len(w) + (1 if cur > 0 else 0)
+#                 if cur + add > max_len:
+#                     break
+#                 cut.append(w)
+#                 cur += add
+#             merged = " ".join(cut).strip()
+#         return merged
 
 
 
 
-    # --- Doc2Query 추출 및 정리 (preprocessed_query와 동일한 위치에서 이어서) start---
-    doc2query_list = extract_doc2query(llm_response)            # 리스트 형태
-    doc2query_str  = " | ".join(doc2query_list) if doc2query_list else ""  # 파이프 병합 문자열
-    # 디버그 로그
-    print(f"[Debug] Doc2Query 리스트 -> {doc2query_list if doc2query_list else '[]'}")
-    print(f"[Debug] Doc2Query 문자열 -> '{doc2query_str}'")
-    # --- Doc2Query 추출 및 정리 (preprocessed_query와 동일한 위치에서 이어서) end---
+
+
+
+#     # --- Doc2Query 추출 및 정리 (preprocessed_query와 동일한 위치에서 이어서) start---
+#     doc2query_list = extract_doc2query(llm_response)            # 리스트 형태
+#     doc2query_str  = " | ".join(doc2query_list) if doc2query_list else ""  # 파이프 병합 문자열
+#     # 디버그 로그
+#     print(f"[Debug] Doc2Query 리스트 -> {doc2query_list if doc2query_list else '[]'}")
+#     print(f"[Debug] Doc2Query 문자열 -> '{doc2query_str}'")
+#     # --- Doc2Query 추출 및 정리 (preprocessed_query와 동일한 위치에서 이어서) end---
 
 
 
@@ -2341,10 +2372,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     terms = extract_preprocessed(llm_response, query)
     preprocessed_query = strip_minus_terms(terms)
 
-    # ===== Doc2Query 상위 2~3개를 Preprocessed Query에 합치기 =====
-    preprocessed_query_before_merge = preprocessed_query
-    preprocessed_query = merge_doc2_into_preprocessed(preprocessed_query, doc2query_list, k=3, max_len=120)
-    print(f"[Debug] Preprocessed+Doc2 합성 -> '{preprocessed_query}'  (before='{preprocessed_query_before_merge}')")
+    # # ===== Doc2Query 상위 2~3개를 Preprocessed Query에 합치기 =====
+    # preprocessed_query_after_merge = merge_doc2_into_preprocessed(preprocessed_query, doc2query_list, k=2, max_len=120)
+
+    # print(f"[Debug] Preprocessed+Doc2 합성 -> '{preprocessed_query_after_merge}'  (before='{preprocessed_query}')")
 
 
     
@@ -2487,8 +2518,18 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     if np.isfinite(n) and n != 0.0:
         q_vec = q_vec / n
     print(f"[Debug] q_vec dim: {q_vec.shape}, norm: {np.linalg.norm(q_vec):.4f}")
-
     # --- ownerclan_category에서 L2로 Top5 카테고리 검색 (방법2에 해당하는 카테고리를 임베딩 벡터검색)---
+
+
+    # #증강된 쿼리 입력 (방법1만 적용)
+    # q_vec_plus = np.array(embedder.embed_query(preprocessed_query_after_merge), dtype=np.float32)
+    # n = np.linalg.norm(q_vec_plus)
+    # if np.isfinite(n) and n != 0.0:
+    #     q_vec_plus = q_vec_plus / n
+    # print(f"[Debug] q_vec dim: {q_vec_plus.shape}, norm: {np.linalg.norm(q_vec_plus):.4f}")
+
+
+
 
     def _build_info_from_hit(hit):
         e = hit.entity
@@ -2717,7 +2758,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # 저장 + 최종 평균 (벡터 + 직접매칭만)
         it["rrf_vec"]   = rrf_vec
         it["rrf_title"] = rrf_title
-        it["rrf_all"]   = (rrf_vec + rrf_title) / 2.0
+        it["rrf_all"]   = (rrf_vec + rrf_title*2) / 3.0
 
         # (로그용) 1000점 환산도 함께 저장
         it["vecScore1000"]   = _rrf_to_1000(rrf_vec, BASE_K)
@@ -2889,7 +2930,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 
                 it["rrf_vec"] = rrf_vec
                 it["rrf_title"] = rrf_title
-                it["rrf_all"] = (rrf_vec + rrf_title) / 2.0
+                it["rrf_all"] = (rrf_vec + rrf_title*2) / 3.0
                 it["검색방식"] = f"카테고리검색_{category}"
 
             # 정렬 및 중복 제거
@@ -2927,29 +2968,29 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     top2_list = []
     top3_list = []
 
-    # Top1 카테고리에서 20개
+    # Top1 카테고리에서 40개
     if top1_category:
         top1_results = search_by_category_method2(top1_category, size=100)
-        top1_list = top1_results[:20]  # 상위 20개만
-        print(f"[방법2] Top1 ({top1_category}): {len(top1_results)}개 중 20개 선택")
+        top1_list = top1_results[:40]  # 상위 40개만
+        print(f"[방법2] Top1 ({top1_category}): {len(top1_results)}개 중 40개 선택")
 
-    # Top2 카테고리에서 20개  
+    # Top2 카테고리에서 40개
     if top2_category:
         top2_results = search_by_category_method2(top2_category, size=100)
-        top2_list = top2_results[:20]  # 상위 20개만
-        print(f"[방법2] Top2 ({top2_category}): {len(top2_results)}개 중 20개 선택")
+        top2_list = top2_results[:40]  # 상위 40개만
+        print(f"[방법2] Top2 ({top2_category}): {len(top2_results)}개 중 40개 선택")
 
-    # Top3 카테고리에서 20개
+    # Top3 카테고리에서 40개
     if top3_category:
         top3_results = search_by_category_method2(top3_category, size=100)
-        top3_list = top3_results[:20]  # 상위 20개만
-        print(f"[방법2] Top3 ({top3_category}): {len(top3_results)}개 중 20개 선택")
+        top3_list = top3_results[:40]  # 상위 40개만
+        print(f"[방법2] Top3 ({top3_category}): {len(top3_results)}개 중 40개 선택")
 
     # 방법2 결과를 10개씩 세트로 구성 (2:2:1 비율 유지)
     method2_all_sets = []
     
-    # 5싸이클 생성 (각 싸이클마다 2:2:1 비율로 5개씩)
-    for cycle in range(5):
+    # 10싸이클 생성 (각 싸이클마다 2:2:1 비율로 5개씩)
+    for cycle in range(10):
         cycle_items = []
         
         # Top1에서 2개 (cycle*2 인덱스부터)
@@ -2969,7 +3010,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         if cycle < len(top3_list):
             cycle_items.extend(top3_list[cycle:cycle+1])
         
-        # 5개 세트가 완성되면 추가 (10개로 채우지 않음!)
+        # 10개 세트가 완성되면 추가 (10개로 채우지 않음!)
         if len(cycle_items) == 5:  # 정확히 5개인 경우만
             method2_all_sets.append(cycle_items)
         elif len(cycle_items) >= 3:  # 최소 3개 이상이면 그대로 추가
@@ -3020,7 +3061,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     total_m2 += 1
         print(f"[세트 {set_num + 1}] 방법2 결과 {method2_added}개 추가")
 
-        # 2) 방법1로 세트 10개 될 때까지 보충(상한 5 제거)
+        # 2) 방법1로 세트 10개 될 때까지 보충
         method1_added = 0
         if method1_all_sets and set_num < len(method1_all_sets):
             for product in method1_all_sets[set_num]:
@@ -3175,15 +3216,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     
     ranking_prompt = f"""사용자가 "{ranking_query}"를 검색했습니다.
 
-다음 10개 상품을 사용자의 검색 의도에 가장 적합한 순서대로 0부터 9까지 번호를 매겨 재정렬해주세요.
+    다음 10개 상품을 사용자의 검색 의도에 가장 적합한 순서대로 0부터 9까지 번호를 매겨 재정렬해주세요.
 
-상품 목록:
-{chr(10).join(products_for_ranking)}
+    상품 목록:
+    {chr(10).join(products_for_ranking)}
 
-응답 형식: 0,1,2,3,4,5,6,7,8,9 (쉼표로 구분된 숫자만)
-예시: 2,0,5,1,8,3,7,4,9,6
+    응답 형식: 0,1,2,3,4,5,6,7,8,9 (쉼표로 구분된 숫자만)
+    예시: 2,0,5,1,8,3,7,4,9,6
 
-재정렬된 순서:"""
+    재정렬된 순서:"""
 
     try:
         # LLM으로 리랭킹 순서 받기
@@ -3881,15 +3922,15 @@ async def get_user_details(user_id: str):
 
 
 
-
+# ───── 모든 라우트 등록이 끝난 뒤, 마지막에 ─────
 
 if __name__ == '__main__':
-    import uvicorn
     
     # 환경 변수에서 설정 가져오기
     host = '0.0.0.0'
     port = 8011
     debug = True
-    
+    TRUSTED = os.getenv("FORWARDED_ALLOW_IPS", "")
+
     print(f"🚀 FastAPI 서버 시작: {host}:{port} (debug={debug})")
-    uvicorn.run("app:app", host=host, port=port, reload=debug)
+    uvicorn.run("app:app", host=host, port=port, reload=debug, proxy_headers=True,forwarded_allow_ips=TRUSTED)
