@@ -1,4 +1,3 @@
-# 데이터의 구조가 바뀐 시초의 ownerclan
 import numpy as np
 from langchain_openai import OpenAI, OpenAIEmbeddings
 from pymilvus import Collection, connections
@@ -1526,13 +1525,31 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     
     def remove_direct_search_keywords(text: str) -> str:
         """
-        바로검색 명령어 패턴을 모두 제거
+        바로검색 명령어 패턴을 모두 제거 (강력한 버전)
         """
+        if not text:
+            return text
+            
         t = text
+        
+        # 1. 기본 패턴 제거
         for kw in direct_search_patterns:
+            # 대소문자 구분 없이 제거
+            t = t.replace(kw.lower(), "")
+            t = t.replace(kw.upper(), "")
             t = t.replace(kw, "")
+            # 공백 제거된 버전도 처리
             t = t.replace(kw.replace(" ", ""), "")
-        return t.strip()
+        
+        # 2. 추가 정리
+        # 연속된 공백을 하나로
+        import re
+        t = re.sub(r'\s+', ' ', t)
+        
+        # 앞뒤 공백 제거
+        t = t.strip()
+        
+        return t
 
 
 
@@ -1666,10 +1683,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     4) 바로 아래에 A)~D) **단어형 선택지** 제시(한 축만).
 
 
-
-
-
-
     🌍 언어 규칙
     - **사용자 언어 감지 → {target_lang}로만 출력**. 혼합 금지.
 
@@ -1686,15 +1699,12 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     🚦 Route 규칙
     - 기본 route="clarify". 충분히 구체(카테고리+핵심 속성 3개 이상)면 route="proceed"로 전환(이때만 clarify_question="").
 
+    재질문의 질문 길이는 한글은 200자 이내 영어는 250자 이내로 합니다.
+    
     ✅ 자가 점검 체크리스트
     1) category_anchor 이탈 없음? 2) Lock 축 재질문 아님? 3) 한 세트=한 축?
     4) 선택지 4개 모두 제목 토큰? 5) 금지 항목 미사용? 6) 직교성 확보?
     7) clarify_question이 비어있지 않은가(route="clarify"일 때)?
-    
-
-    
-
-
     
     🚨 **중요한 출력 규칙:**
     - route="clarify"인 경우, clarify_question은 **절대 빈 문자열이면 안됩니다**.
@@ -2112,17 +2122,18 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-    # 바로검색 명령어 제거
-    query = remove_direct_search_keywords(query)
-    combined_query = remove_direct_search_keywords(combined_query)
-
-
-
     # 🚀 **핵심 수정**: 바로검색 명령어 우선 확인 (Intent Gate 이전)
+    # ⚠️ 주의: 바로검색 감지를 위해 키워드 제거 전에 먼저 확인!
+    
     if check_direct_search_command(combined_query if len(user_query_parts) > 1 else query):
         search_query = combined_query if len(user_query_parts) > 1 else query
         print(f"[바로검색] 명령어 감지: '{search_query}' → Intent Gate 건너뛰고 바로 검색")
-        query = search_query
+        
+        # 🔥 바로검색 감지 후에만 키워드 제거 (기존 변수명 유지)
+        query = remove_direct_search_keywords(query)
+        combined_query = remove_direct_search_keywords(combined_query)
+        print(f"[바로검색] 키워드 제거 후 query: '{query}', combined_query: '{combined_query}'")
+        
         pass  # 바로 검색으로 진행
     else:
         # clarify 답변 수집
@@ -2238,9 +2249,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # ===== 여기까지 내려오면 통과 → 아래 전처리/카테고리/임베딩 검색 계속 =====
     # ===== 통과 시 아래 원래 system_prompt 로직 계속 진행    재질문 END =====
 
-
-
-
+    # 🚨 중요: 바로검색 키워드 제거는 바로검색 감지 후에만 수행됨 (위에서 이미 처리)
 
     system_prompt = (
         f"""System:
@@ -2269,8 +2278,14 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                - 이전: "여름가방" → 현재: "작은거" → **결과: "여름가방 작은"**
                - 이전: "겨울장갑 국내산" → 현재: "저렴한" → **결과: "겨울장갑 국내산 저렴한"**
             
+            **🚨 STEP 4: 바로검색 키워드 완전 제거 (절대 필수!)**
+             - **금지 키워드**: "나로수", "narosu" 등 바로검색 명령어는 절대 포함 금지!
+             - 입력에 바로검색 키워드가 있어도 최종 결과에서는 완전히 제거할 것!
+             - 예시: "여성 구두 나로수" → **결과: "여성 구두"** (나로수 완전 삭제)
+            
             3. 🎯 최종 검색어 생성 강제 공식:
             - **절대 규칙**: 이전 맥락 무시 금지! 반드시 누적하여 검색어 생성할 것!
+            - **절대 규칙**: 바로검색 키워드는 절대 포함 금지!
 
  
             [전처리 원칙]
@@ -2350,8 +2365,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         1. 위 이전 대화 이력에서 상품명/조건 추출
         2. 현재 입력과 이전 맥락을 강제로 결합
         3. 결합된 검색어로 전처리 수행
+        4. 🚨 **바로검색 키워드 완전 제거**: "나로수", "narosu" 등은 절대 포함하지 말 것!
 
-        반드시 이전 맥락을 반영한 검색어를 생성하세요!
+        반드시 이전 맥락을 반영한 검색어를 생성하되, 바로검색 키워드는 완전히 제거하세요!
         """
 
     resp = client.chat.completions.create(
@@ -2603,7 +2619,14 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     category_search_text = extract_category_text_new(llm_response)
     terms = extract_preprocessed(llm_response, query)
+    terms = remove_direct_search_keywords(terms)
     preprocessed_query = strip_minus_terms(terms)
+
+    # 🔥 여기에 추가!
+    preprocessed_query = remove_direct_search_keywords(preprocessed_query)
+    category_search_text = remove_direct_search_keywords(category_search_text)
+
+    print(f"[Debug] 바로검색 키워드 최종 제거: '{preprocessed_query}'")
 
     # # ===== Doc2Query 상위 2~3개를 Preprocessed Query에 합치기 =====
     # preprocessed_query_after_merge = merge_doc2_into_preprocessed(preprocessed_query, doc2query_list, k=2, max_len=120)
@@ -2675,7 +2698,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         if name and name not in seen_names:
             cat_match_results.append({"input": category_search_text, "matches": [m]})
             seen_names.add(name)
-            print(f"\n[CatMatch] '{category_search_text}' → '{name}' (L2={float(m.get('distance',0.0)):.6f})")
+            print(f"\n[CatMatch] '{category_search_text}' → '{name}' 매칭 완료")
             
             if len(cat_match_results) >= 3:  # Top3까지만
                 break
@@ -2710,7 +2733,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     n = np.linalg.norm(q_vec)
     if np.isfinite(n) and n != 0.0:
         q_vec = q_vec / n
-    # --- ownerclan_category에서 L2로 Top5 카테고리 검색 (방법2에 해당하는 카테고리를 임베딩 벡터검색)---
 
 
     # #증강된 쿼리 입력 (방법1만 적용)

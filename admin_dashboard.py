@@ -41,12 +41,12 @@ async def get_statistics():
         cursor.execute('SELECT COUNT(*) FROM search_events')
         total_searches = cursor.fetchone()[0]
         
-        # 오늘 상품 조회 수 (2025년 9월 2일 기준)
-        cursor.execute('SELECT COUNT(*) FROM product_views WHERE DATE(timestamp) = "2025-09-02"')
+        # 오늘 상품 조회 수
+        cursor.execute('SELECT COUNT(*) FROM product_views WHERE DATE(timestamp) = DATE("now")')
         today_views = cursor.fetchone()[0]
         
-        # 오늘 검색 수 (2025년 9월 2일 기준)
-        cursor.execute('SELECT COUNT(*) FROM search_events WHERE DATE(timestamp) = "2025-09-02"')
+        # 오늘 검색 수
+        cursor.execute('SELECT COUNT(*) FROM search_events WHERE DATE(timestamp) = DATE("now")')
         today_searches = cursor.fetchone()[0]
         
         conn.close()
@@ -84,7 +84,7 @@ async def get_user_activity(days: int = 7):
         cursor.execute('''
             SELECT DATE(timestamp) as date, COUNT(*) as view_count
             FROM product_views 
-            WHERE timestamp >= "2025-09-02"
+            WHERE timestamp >= DATE("now", '-{} days')
             GROUP BY DATE(timestamp)
             ORDER BY date
         '''.format(days))
@@ -96,7 +96,7 @@ async def get_user_activity(days: int = 7):
             SELECT strftime('%Y-%m-%d', timestamp) as date, 
                    COUNT(*) as search_count
             FROM search_events 
-            WHERE DATE(timestamp) >= "2025-09-02"
+            WHERE DATE(timestamp) >= DATE("now", '-{} days')
             GROUP BY strftime('%Y-%m-%d', timestamp)
             ORDER BY date
         '''.format(days))
@@ -107,7 +107,7 @@ async def get_user_activity(days: int = 7):
         cursor.execute('''
             SELECT strftime('%H', timestamp) as hour, COUNT(*) as count
             FROM product_views 
-            WHERE DATE(timestamp) = "2025-09-02"
+            WHERE DATE(timestamp) = DATE("now")
             GROUP BY strftime('%H', timestamp)
             ORDER BY hour
         ''')
@@ -137,7 +137,7 @@ async def get_category_stats(days: int = None):
         # 기간 필터 조건
         date_filter = ""
         if days:
-            date_filter = f"WHERE timestamp >= '2025-09-02' AND category != '' AND category IS NOT NULL"
+            date_filter = f"WHERE timestamp >= DATE('now', '-{days} days') AND category != '' AND category IS NOT NULL"
         else:
             date_filter = "WHERE category != '' AND category IS NOT NULL"
         
@@ -196,12 +196,15 @@ async def get_period_statistics(days: int = 7):
         conn = sqlite3.connect(event_manager.db_path)
         cursor = conn.cursor()
         
+        # 현재 날짜 가져오기 (한국 시간)
+        korea_now = datetime.utcnow() + timedelta(hours=9)
+        
         # 기간별 사용자 수
         cursor.execute('''
             SELECT COUNT(DISTINCT user_id) as user_count
             FROM users 
-            WHERE created_at >= datetime('now', '-{} days')
-        '''.format(days))
+            WHERE created_at >= ?
+        ''', (korea_now - timedelta(days=days),))
         
         period_users = cursor.fetchone()[0]
         
@@ -209,8 +212,8 @@ async def get_period_statistics(days: int = 7):
         cursor.execute('''
             SELECT COUNT(*) as view_count
             FROM product_views 
-            WHERE timestamp >= datetime('now', '-{} days')
-        '''.format(days))
+            WHERE timestamp >= ?
+        ''', (korea_now - timedelta(days=days),))
         
         period_views = cursor.fetchone()[0]
         
@@ -218,8 +221,8 @@ async def get_period_statistics(days: int = 7):
         cursor.execute('''
             SELECT COUNT(*) as search_count
             FROM search_events 
-            WHERE datetime(timestamp, '+9 hours') >= datetime('now', '+9 hours', '-{} days')
-        '''.format(days))
+            WHERE datetime(timestamp, '+9 hours') >= ?
+        ''', (korea_now - timedelta(days=days),))
         
         period_searches = cursor.fetchone()[0]
         
