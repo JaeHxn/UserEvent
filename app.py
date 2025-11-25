@@ -98,7 +98,7 @@ def _eq_ci(a, b):  # 아이디용(대소문자 무시하고 싶을 때)
 
 
 # ── 설정 ─────────────────────────────────────────────────────────
-API_KEY    = os.getenv('OPENAI_API_KEY', 'your_openai_api_key_here')
+API_KEY    = os.getenv('OPENAI_API_KEY', '')
 
 REDIS_URL = "redis://localhost:6379/0"                    # ← 환경변수에서 로드
 COLLECTION = "ownerclan"            # Milvus 컬렉션 이름
@@ -130,6 +130,16 @@ SESSION_WARNING_MINUTES = 1  # 1분 후 경고 메시지
 
 TIMEOUT_SECONDS = int(SESSION_TIMEOUT_MINUTES * 60)  # 정수로 변환
 WARNING_SECONDS = SESSION_WARNING_MINUTES * 60  # 경고를 쓸 경우
+
+HOMEPAGE_URL = "https://www.chatmall.kr/"  # 홈페이지 이동 응답용
+DELIVERY_INQUIRY_URL = "https://www.chatmall.kr/shop/orderinquiry.php"  # 배송/주문 조회 안내
+
+
+
+
+
+
+
 
 
 # 1) Milvus 서버에 먼저 연결
@@ -718,7 +728,7 @@ class Ranker_DirectSearch:
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:
     # 🔧 재질문 임계값 통일 설정
     THRESHOLD = 0.7             # 평균 점수 임계값 (이상이면 검색 진행)
-    DIRECT_MATCH_HIGH = 0.75      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
+    DIRECT_MATCH_HIGH = 0.85      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
     FACET_COVERAGE_MIN = 0.50     # 최소 속성 커버리지 (미달 시 재질문)
     ATTRIBUTE_MIN = 0.55         # 속성 매칭 최소값
     FACET_SUFFICIENT = 0.55       # 충분한 속성 커버리지
@@ -759,7 +769,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
                 # 안내 메시지
                 msg = (
-                    f"💫 The last conversation was not present for 0.5 minutes and was automatically initialized. Start Search for New Products! Enter Your Search Word 😊\n\n"
+                    f"💫 It was automatically reset after there was no response for a certain period of time since the last conversation. Start searching for a new product! Enter a search term 😊\n\n"
                 )
 
                 # 새 세션에 안내 메시지 저장 + TTL 설정
@@ -824,6 +834,195 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         completion_percent = int(round(completion_ratio * 100))
         
         return completion_ratio, completion_percent
+    
+    def is_delivery_intent(text: str) -> bool:
+        """
+        배송/주문 조회 의도를 LLM 없이 패턴 기반으로 감지
+        - 의미론적 패턴: "어디", "언제", "상태", "확인" 등 + 주문/배송 관련
+        - 영어 표현 대폭 확장
+        """
+        if not text:
+            return False
+            
+        t = text.lower()
+        
+        # 🎯 핵심 개념 기반 패턴 (영어 대폭 확장)
+        delivery_concepts = {
+            # 추적/조회 개념 (15개 → 30개)
+            "tracking": [
+                # 한국어
+                "track", "추적", "조회", "확인",
+                # 영어 - 추적 관련
+                "track", "tracking", "trace", "tracing", "follow", "following",
+                "locate", "locating", "find", "finding", "check", "checking",
+                "monitor", "monitoring", "view", "viewing", "see", "seeing",
+                "watch", "watching", "observe", "observing", "inspect", "inspecting",
+                "verify", "verifying", "confirm", "confirming", "review", "reviewing"
+            ],
+            
+            # 위치/장소 개념 (8개 → 20개)
+            "location": [
+                # 한국어
+                "어디", "위치", "장소",
+                # 영어 - 위치 질문
+                "where", "where is", "where's", "location", "place", "position",
+                "whereabouts", "spot", "site", "area", "zone",
+                "current location", "present location", "at what place",
+                "in what location", "what place", "which place"
+            ],
+            
+            # 상태 확인 개념 (12개 → 35개)
+            "status": [
+                # 한국어
+                "상태", "확인", "현황", "진행", "진행상황",
+                # 영어 - 상태 관련
+                "status", "state", "condition", "situation", "standing",
+                "update", "updates", "progress", "stage", "phase",
+                "check on", "look up", "look into", "verify", "confirm",
+                "see", "view", "check status", "get status", "know status",
+                "information", "info", "details", "data", "record",
+                "current status", "latest status", "order status"
+            ],
+            
+            # 도착/배송 시간 개념 (15개 → 40개)
+            "arrival": [
+                # 한국어
+                "when", "언제", "arrive", "도착", "배송일", "받을", "도착예정",
+                # 영어 - 시간 관련
+                "when", "when will", "when does", "when can", "what time",
+                "arrive", "arrival", "arriving", "reached", "delivered",
+                "get here", "get to me", "come", "coming", "receive", "receiving",
+                "expect", "expected", "expecting", "anticipate", "anticipated",
+                "delivery date", "delivery time", "arrival date", "arrival time",
+                "eta", "estimated", "estimate", "how long", "how soon", "how many days",
+                "ship date", "shipping date", "dispatch date", "sent date"
+            ],
+            
+            # 주문 개념 (8개 → 25개) - 🔥 order 추가!
+            "order": [
+                # 한국어
+                "order", "주문", "구매", "산거", "주문한", "구매한",
+                # 영어 - 주문 관련 (문맥 필수!)
+                "my order", "the order", "this order", "that order", "order status",
+                "order number", "order id", "order code", "order reference",
+                "purchase", "purchased", "bought", "ordered", "placed order",
+                "order history", "recent order", "last order", "latest order",
+                "order info", "order information", "order details"
+            ],
+            
+            # 배송/택배 개념 (15개 → 45개)
+            "package": [
+                # 한국어
+                "package", "배송", "delivery", "shipping", "택배", "소포", "화물",
+                # 영어 - 배송 관련
+                "delivery", "deliveries", "deliver", "delivering",
+                "shipping", "shipment", "shipped", "ship", "shipper",
+                "package", "packages", "parcel", "parcels", "item", "items",
+                "mail", "post", "postal", "courier", "carrier", "freight",
+                "express", "express delivery", "fast delivery", "quick delivery",
+                "dispatch", "dispatched", "dispatching", "sent", "send", "sending",
+                "consignment", "goods", "cargo", "product delivery"
+            ]
+        }
+        
+        # 패턴 매칭: 각 개념별로 키워드 체크
+        matched_concepts = []
+        for concept, keywords in delivery_concepts.items():
+            if any(kw in t for kw in keywords):
+                matched_concepts.append(concept)
+        
+        print(f"[배송의도감지] 입력: '{text}' → 매칭된 개념: {matched_concepts}")
+        
+        # 🔥 의도 판별 로직 (개념 조합으로 판단)
+        # 1) "추적/조회" + "주문/배송" → 배송조회
+        if "tracking" in matched_concepts and ("order" in matched_concepts or "package" in matched_concepts):
+            print(f"[배송의도감지] ✅ 패턴1: 추적+주문/배송")
+            return True
+            
+        # 2) "위치/상태" + "배송/주문" → 배송조회  
+        if ("location" in matched_concepts or "status" in matched_concepts) and \
+           ("package" in matched_concepts or "order" in matched_concepts):
+            print(f"[배송의도감지] ✅ 패턴2: 위치/상태+배송/주문")
+            return True
+            
+        # 3) "언제 도착" + "주문/배송" → 배송조회
+        if "arrival" in matched_concepts and ("package" in matched_concepts or "order" in matched_concepts):
+            print(f"[배송의도감지] ✅ 패턴3: 도착시간+주문/배송")
+            return True
+        
+        # 4) "추적/조회" + "위치/상태" → 배송조회 (배송 단어 없어도)
+        if "tracking" in matched_concepts and ("location" in matched_concepts or "status" in matched_concepts):
+            print(f"[배송의도감지] ✅ 패턴4: 추적+위치/상태")
+            return True
+        
+        print(f"[배송의도감지] ❌ 패턴 미일치")
+        return False
+
+
+    def is_homepage_intent(text: str) -> bool:
+        """
+        사용자가 홈페이지로 이동/주소 요청 의도인지 감지.
+        공백 제거 패턴도 함께 체크.
+        """
+        t = (text or "").lower()
+        t_nospace = re.sub(r"\s+", "", t)
+        keywords = [
+            "홈페이지", "홈페이지주소", "홈페이지링크", "홈페이지로이동", "홈페이지접속",
+            "사이트주소", "사이트링크", "사이트로이동", "사이트접속",
+            "website", "home page", "homepage","web URL","website address","go to website","visit website"
+        ]
+        for kw in keywords:
+            if kw in t or kw in t_nospace:
+                return True
+        return False
+
+    def is_greeting_or_intro_intent(text: str) -> bool:
+        """
+        인사 또는 챗봇 소개 요청 의도를 감지한다.
+        - 한국어/영어 인사말, "뭐 하는지", "누구세요", "기능" 등
+        """
+        if not text:
+            return False
+            
+        t = text.lower().strip()
+        t_nospace = re.sub(r"\s+", "", t)
+        
+        # 인사/소개 키워드
+        keywords = [
+            # 한국어 인사
+            "안녕", "안녕하세요", "안녕하십니까", "반갑습니다", "반가워요",
+            "하이", "헬로", "hi", "hello", "hey", "good morning", "good afternoon",
+            
+            # 챗봇 소개 요청
+            "뭐하는", "뭐 하는", "무엇을하는", "무슨기능", "기능이뭐", "뭘도와주는",
+            "누구", "누구세요", "누구야", "정체가뭐", "어떤챗봇",
+            "what do you do", "what can you do", "who are you", "what are you",
+            "introduce yourself", "tell me about yourself", "your function",
+            "help me", "how can you help", "what is your purpose","What can I do?"
+        ]
+        
+        for kw in keywords:
+            kw_clean = re.sub(r"\s+", "", kw.lower())
+            if kw_clean in t_nospace or kw.lower() in t:
+                return True
+        
+        # 추가 패턴: 짧은 인사말 (3글자 이하 한글)
+        if len(t) <= 5 and re.match(r'^[ㄱ-ㅎ가-힣]+$', t):
+            if any(word in t for word in ["안녕", "하이", "헬로", "hi"]):
+                return True
+        
+        return False
+
+
+
+
+
+
+
+
+
+
+
     
     collection = Collection(COLLECTION)   #다시 상품 DB 컬렉션으로 연결
     def convert_to_serializable(obj):
@@ -890,7 +1089,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     
 
     print("[Debug] Raw query:", query)            # ← 여기에!
-    lang_code = detect(query)
+    # lang_code = detect(query)
 
     # ✅ Redis 세션 기록 불러오기 및 최신 입력 저장
     session_history = get_session_history(session_id)
@@ -911,13 +1110,13 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     else:
         print("[세션체크] 리셋 직후 첫 메시지 → timeout 체크 스킵")
     
-    # 🕒 세션 자동 만료 체크 (경고 없이 바로 처리)
-    timeout_result = check_session_timeout(session_history, session_id)
-    print(f"[세션체크] timeout_result={timeout_result}")
-    if timeout_result and timeout_result.get("session_expired"):
-        # 세션이 만료된 경우 자동 초기화 메시지를 즉시 반환 (이미 Redis에 저장됨)
-        print(f"[세션만료] 자동 초기화 메시지 반환: {timeout_result['assistant_message'][:50]}...")
-        return timeout_result
+    # # 🕒 세션 자동 만료 체크 (경고 없이 바로 처리)
+    # timeout_result = check_session_timeout(session_history, session_id)
+    # print(f"[세션체크] timeout_result={timeout_result}")
+    # if timeout_result and timeout_result.get("session_expired"):
+    #     # 세션이 만료된 경우 자동 초기화 메시지를 즉시 반환 (이미 Redis에 저장됨)
+    #     print(f"[세션만료] 자동 초기화 메시지 반환: {timeout_result['assistant_message'][:50]}...")
+    #     return timeout_result
 
 
 
@@ -932,7 +1131,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         r.expire(f"message_store:{session_id}", TIMEOUT_SECONDS)  # 활동할 때마다 연장
     except Exception as e:
         print(f"[세션 TTL 갱신 오류] {e}")
-
 
 
 
@@ -1596,6 +1794,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     
     # --- LLM 프롬프트: 의도 파악 + 스마트 재질문 통합 (ui_message) ---
+
     INTENT_GATE_PROMPT = lambda user_query, recent_context: f"""
     **Professional Product Consultation AI - Specific Product Tailored Questioning**
     Output must be a single JSON object only. No other text or comments.
@@ -1607,7 +1806,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     Read the query and conversation summary, then:
     - Understand what product or category the user is trying to find.
     - Select exactly one axis that will most effectively narrow down the product candidates.
-    - Ask one follow-up question with A~D choices, strictly focused on that single axis.
+    - Ask one follow-up question with A,B,C,D choices, strictly focused on that single axis.
     - Never repeat axes or values that are already fixed in the conversation.
 
     --------------------------------------------------
@@ -1639,8 +1838,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         - If the user_query implies “AirPods” → the question must include “AirPods”.
         - If the user_query implies “ramen” → the question must include “ramen”.
 
-    3) Choices (A~D) for the “which-type” axis:
-    - A~D MUST be concrete, real-world variants or representative types within that product.
+    3) Choices (A,B,C,D) for the “which-type” axis:
+    - A,B,C,D MUST be concrete, real-world variants or representative types within that product.
     - Examples of the pattern (do not hard-code these; adapt to the product):
         - Clothes: shirt / jacket / coat / dress
         - Earphones: entry model / noise-cancelling model / sports-fit model / premium model
@@ -1700,12 +1899,12 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     (c) Purchase impact: does it strongly influence which product will be chosen?
     5) Generate:
     - one clarify_question following the structure above, and
-    - four options A~D strictly on that axis.
+    - four options A,B,C,D strictly on that axis.
 
     Do not mix multiple axes in a single question.
 
     --------------------------------------------------
-    Choice (A~D) rules
+    Choice (A,B,C,D) rules
     --------------------------------------------------
 
     - Always generate exactly four options: A, B, C, and D.
@@ -1720,7 +1919,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - Mix unrelated axes inside one option (e.g., “cheap AND premium brand AND waterproof”).
     - Include “Other”, “Etc”, “Type it yourself”, or any equivalent wording as A, B, C, or D.
 
-    - If allowing free-text input is useful, keep A~D as concrete options and optionally add a separate sentence after the list, such as:
+    - If allowing free-text input is useful, keep A,B,C,D as concrete options and optionally add a separate sentence after the list, such as:
     - “If none of these match, you can answer in your own words.”
     This must not be treated as an extra option.
 
@@ -1773,20 +1972,20 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - avg_score = (direct_match + attribute_match + context_match + brand_match) / 4
     - Round to two decimals.
 
-    📦 expanded_terms
+    expanded_terms
     - From the user’s answer (choice or free text), extract 3~6 **Korean retail search keywords** (remove stopwords/emotional words, keep noun-like tokens).
-    🚦 Route rules
+    Route rules
     - Default is route="clarify". If the query is sufficiently specific (category + 3 or more key attributes), switch to route="proceed" (only then set clarify_question="").
 
     The length of the follow-up question must be within 200 characters in Korean or 250 characters in English.
     
-    🚨 **Important output rules:**
+    **Important output rules:**
     - When route="clarify", clarify_question must **never** be an empty string.
     - If clarify_question is empty, the system will malfunction. You must always generate a valid question.
     - Only when route="proceed" may clarify_question be set to the empty string ("").
     
 
-    🌍 Language rules
+    Language rules
     - Detect the user’s language → then output **only in {target_lang}**. Do not generate text in any other language. No mixing of languages.
 
     JSON schema:
@@ -1797,7 +1996,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     "brand_match": 0.0,
     "avg_score": 0.0,
     "route": "clarify",
-    "clarify_question": "Natural follow-up question like a sales expert + A~D choices",
+    "clarify_question": "Natural follow-up question like a sales expert + A,B,C,D choices",
     "expanded_terms": ["3~6 Korean keywords useful for search"],
     "notes": ["Rationale for your judgment"]
     }}
@@ -1822,6 +2021,92 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 "completion_message": "🚀 바로검색 모드"
             }
         
+
+        # 🏠 홈페이지 이동 의도 감지 체크 추가
+        if is_homepage_intent(user_query):
+            print(f"[홈페이지 이동] 의도 감지: '{user_query}' → 재질문 패스")
+            homepage_message = f"🏠 홈페이지로 이동합니다: {HOMEPAGE_URL}" if target_lang == "한국어" else f"🏠 Redirecting to homepage: {HOMEPAGE_URL}"
+            
+            return {
+                "direct_match": 1.0,
+                "context_match": 1.0,
+                "attribute_match": 1.0,
+                "brand_match": 1.0,
+                "avg_score": 1.0,
+                "route": "homepage",
+                "clarify_question": "",
+                "homepage_url": HOMEPAGE_URL,
+                "homepage_message": homepage_message,
+                "is_homepage_intent": True,
+                "expanded_terms": [],
+                "notes": ["Homepage navigation intent detected"],
+                "completion_ratio": 1.0,
+                "completion_percent": 100
+            }
+
+        # 🚚 배송/주문 조회 의도 감지 체크 추가
+        if is_delivery_intent(user_query):
+            print(f"[배송조회] 의도 감지: '{user_query}' → 재질문 패스")
+            delivery_message = (
+                f"배송/주문 조회는 {DELIVERY_INQUIRY_URL} 에서 바로 확인할 수 있어요. " if target_lang == "한국어" else f"Delivery/Order status: {DELIVERY_INQUIRY_URL}"
+            )
+            
+            return {
+                "direct_match": 1.0,
+                "context_match": 1.0,
+                "attribute_match": 1.0,
+                "brand_match": 1.0,
+                "avg_score": 1.0,
+                "route": "delivery",
+                "clarify_question": "",
+                "delivery_url": DELIVERY_INQUIRY_URL,
+                "delivery_message": delivery_message,
+                "is_delivery_intent": True,
+                "expanded_terms": [],
+                "notes": ["Delivery inquiry intent detected"],
+                "completion_ratio": 1.0,
+                "completion_percent": 100
+            }
+
+        # 👋 인사/소개 의도 감지 (새로 추가)
+        if is_greeting_or_intro_intent(user_query):
+            print(f"[인사/소개] 의도 감지: '{user_query}' → 챗봇 소개 응답")
+            
+            # 언어별 소개 메시지
+            greeting_messages = {
+                "한국어": (
+                    "안녕하세요! 👋\n\n"
+                    "저는 상품 검색을 도와드리는 AI 챗봇입니다. 🤖\n"
+                    "찾으시는 상품을 말씀해 주시면 최적의 결과를 추천해 드리겠습니다!\n\n"
+                    "예: '여름용 가방', '겨울 따뜻한 장갑', '운동화 추천해줘' 등"
+                ),
+                "English": (
+                    "Hello! 👋\n\n"
+                    "I'm an AI chatbot that helps you search for products. 🤖\n"
+                    "Tell me what you're looking for, and I'll recommend the best results!\n\n"
+                    "Examples: 'summer bag', 'warm winter gloves', 'recommend sneakers'"
+                )
+            }
+            
+            greeting_message = greeting_messages.get(target_lang, greeting_messages["English"])
+            
+            return {
+                "direct_match": 1.0,
+                "context_match": 1.0,
+                "attribute_match": 1.0,
+                "brand_match": 1.0,
+                "avg_score": 1.0,
+                "route": "greeting",
+                "clarify_question": "",
+                "greeting_message": greeting_message,
+                "is_greeting_intent": True,
+                "expanded_terms": [],
+                "notes": ["Greeting or introduction intent detected"],
+                "completion_ratio": 1.0,
+                "completion_percent": 100
+            }
+
+
         # 1) 최근 문맥 안정 구성
         recent_context = _build_recent_context(session_history, k=7)
         
@@ -2124,13 +2409,99 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     # ===== Intent Gate 실행 및 게이트 판정 =====
     intent_eval = run_intent_gate(query, session_history, client, model=LLM_MODEL)
+
+
+
+
+    # ✅ 홈페이지 이동 의도 체크 (재질문 카운팅 제외 + 검색 리셋)
+    if intent_eval.get("is_homepage_intent"):
+        homepage_message = intent_eval.get("homepage_message", "🏠 홈페이지로 이동합니다.")
+        homepage_url = intent_eval.get("homepage_url", HOMEPAGE_URL)
+
+        # 🔄 검색/대화 리셋
+        try:
+            clear_message_history(session_id)              # 전체 히스토리 삭제
+            session_history = RedisChatMessageHistory(session_id=session_id, url=REDIS_URL)
+            session_history.add_ai_message(homepage_message)
+            PRODUCT_CACHE.clear()                          # (선택) 상품 캐시도 초기화
+            print("[홈페이지 이동] 검색/세션 리셋 완료")
+        except Exception as e:
+            print(f"[홈페이지 리셋 오류] {e}")
+
+        return {
+            "query": "",                     # 검색어 비움
+            "assistant_message": homepage_message,
+            "UserMessage": homepage_message,
+            "RawContext": [],                # 리셋 이후 빈 컨텍스트
+            "results": [],                   # 결과 없음
+            "combined_message_text": homepage_message,
+            "homepage_url": homepage_url,
+            "is_homepage_intent": True,
+            "needs_clarification": False,
+            "clarification_count": 0,
+            "reset": True,                   # ✅ 리셋 플래그
+        }
+    
+    # ✅ 배송/주문 조회 의도 체크 (재질문 카운팅 제외 + 검색 리셋)
+    if intent_eval.get("is_delivery_intent"):
+        delivery_message = intent_eval.get("delivery_message", "배송 조회 페이지로 이동합니다.")
+        delivery_url = intent_eval.get("delivery_url", DELIVERY_INQUIRY_URL)
+
+        # 🔄 검색/대화 리셋
+        try:
+            clear_message_history(session_id)
+            session_history = RedisChatMessageHistory(session_id=session_id, url=REDIS_URL)
+            session_history.add_ai_message(delivery_message)
+            PRODUCT_CACHE.clear()
+            print("[배송조회 이동] 검색/세션 리셋 완료")
+        except Exception as e:
+            print(f"[배송 리셋 오류] {e}")
+
+        return {
+            "query": "",
+            "assistant_message": delivery_message,
+            "UserMessage": delivery_message,
+            "RawContext": [],
+            "results": [],
+            "combined_message_text": delivery_message,
+            "delivery_url": delivery_url,
+            "is_delivery_intent": True,
+            "needs_clarification": False,
+            "clarification_count": 0,
+            "reset": True,
+        }
+
+    # ✅ 인사/소개 의도 체크 (재질문 카운팅 제외)
+    if intent_eval.get("is_greeting_intent"):
+        greeting_message = intent_eval.get("greeting_message", "안녕하세요!")
+        
+        # 세션에 AI 메시지 저장
+        try:
+            session_history.add_ai_message(f"[GREETING_INTENT]{greeting_message}")
+        except Exception as e:
+            print(f"[인사 메시지 저장 오류] {e}")
+        
+        return {
+            "query": query,
+            "assistant_message": greeting_message,
+            "UserMessage": greeting_message,
+            "RawContext": [m.content for m in session_history.messages],
+            "results": [],
+            "combined_message_text": greeting_message,
+            "is_greeting_intent": True,
+            "needs_clarification": False,
+            "clarification_count": 0,
+        }
+
+
+
+
     avg_score = float(intent_eval.get("avg_score", 0.0))
     route = (intent_eval.get("route") or "").lower()
     completion_percent = intent_eval.get("completion_percent", 0)
     print(f"[IntentGate] avg={avg_score:.2f} route={route}"
         f"D={intent_eval.get('direct_match')} C={intent_eval.get('context_match')} "
         f"A={intent_eval.get('attribute_match')} B={intent_eval.get('brand_match')}")
-
     
 
     # 🔄 재질문 횟수 추적 및 누적 쿼리 관리 - 완전 개선
@@ -2177,21 +2548,44 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             if not content.strip():
                 continue
 
+        
+            mtype = getattr(msg, 'type', 'unknown')
+            # 🏠 홈페이지 안내 메시지는 재질문 카운트에서 제외
+            # ✅ 안내 메시지 그대로 유지 (continue 제거)
+            if content.startswith("[HOMEPAGE_INTENT]"):
+                print(f"[Context 보존] 홈페이지 안내 유지: '{content[:50]}'")
+            elif content.startswith("[DELIVERY_INTENT]"):
+                print(f"[Context 보존] 배송조회 안내 유지: '{content[:50]}'")
+            elif content.startswith("[GREETING_INTENT]"):
+                print(f"[Context 보존] 인사 안내 유지: '{content[:50]}'")
+
+
+
             print(f"[디버그] 메시지 {i}: type={getattr(msg, 'type', 'unknown')}, content='{content[:100]}'")
 
-            # 🎯 AI 메시지에서 route가 clarify인 경우 카운트
-            if hasattr(msg, 'type') and msg.type == 'ai':
-                if content.startswith("[INTENT_GATE]"):
-                    try:
-                        j = json.loads(content[len("[INTENT_GATE]"):])
-                        if (j.get("route") or "").lower() == "clarify":
-                            clarification_count += 1
-                            print(f"[재질문 감지] {clarification_count}번째 (route=clarify) 감지")
-                    except Exception:
-                        pass
+            # 🎯 clarify 재질문 카운트 (AI INTENT_GATE)
+            if mtype == 'ai' and content.startswith("[INTENT_GATE]"):
+                try:
+                    j = json.loads(content[len("[INTENT_GATE]"):])
+                    if (j.get("route") or "").lower() == "clarify":
+                        clarification_count += 1
+                        print(f"[재질문 감지] {clarification_count}번째 (route=clarify)")
+                except Exception:
+                    pass
+                continue  # INTENT_GATE 전체는 누적쿼리 구성 제외
 
-            # 🔍 사용자 메시지 수집 (INTENT_GATE 태그 제외)
-            elif hasattr(msg, 'type') and msg.type == 'human':
+            # ✅ 사용자 메시지 처리
+            if mtype == 'human':
+                low = content.lower()
+
+                # 홈페이지/배송/인사/URL 의도 사용자 입력은 누적 제외 (요구사항 유지)
+                if (is_homepage_intent(content) or
+                    is_delivery_intent(content) or
+                    is_greeting_or_intro_intent(content) or
+                    "chatmall.kr" in low or "http://" in low or "https://" in low):
+                    print(f"[누적쿼리 제외] 네비/배송/인사/URL 사용자 입력: '{content}'")
+                    continue
+
                 if "[INTENT_GATE]" in content:
                     continue
 
@@ -2199,18 +2593,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 if not clean_content:
                     continue
 
-                # 👉 여기서 단답형(A/B/네/1 등) 날려줌
                 if _is_short_answer(clean_content):
                     print(f"[단답형 제외] '{clean_content}'")
                     continue
 
-                # 너무 긴 설명은 누적쿼리에서 제외하고 싶은 경우 여기 조건 조절
                 if len(clean_content) < 50:
                     user_query_parts.append(clean_content)
                     print(f"[사용자 질문 수집] '{clean_content}'")
 
-        # ❌ 이 줄은 삭제 (문장 리스트를 단어 리스트로 깨버림)
-        # user_query_parts = [s for s in clean_accumulated_query(user_query_parts).split() if s]
+
 
     except Exception as e:
         print(f"[재질문 추적 오류] {e}")
@@ -2432,29 +2823,55 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 
                 **요구사항:**
                 1) 길이: 8~16자(공백 포함, 가능하면 12자 내외)
-                2) 관형어 1개 이상 포함: 예) 먹는/쓰는/입는/바르는/메는/신는/쓰는(착용) 등등 문장과 자연스럽게
+                2) 관형어 1개 이상 포함: 예) 먹는/쓰는/입는/바르는/메는/신는/쓰는(착용) 등등 문장과 자연스럽게.
                 3) 브랜드/트렌드/마케팅 단어 금지: “다양한, 트렌드, 제품, 합리적, 프리미엄, 스타일리시, 최적”
                 4) 불필요한 종결어미 생략
                 5) 핵심 품목 불명확 시: **추정 금지, 원문 유지**
                 6) **부정/제외 표현(제외/빼고/말고/without 등) 금지.** 결과 문장은 제외 대상 자체를 언급하지 말 것.
+                7) 문장 제일 앞에 너가 추측해서 1등 일것 같은 카테고리 추가. 예시) 화과자, 베이컨, 밀가루
 
                 **올바른 예시:**
-                - "여름용 작은 가방" → "여름용 작은 가방 입니다"
-                - "운동할 때 신는 신발" → "운동용 신는 신발 입니다"  
-                - "겨울 따뜻한 외투" → "겨울철 따뜻한 외투 입니다"
+                - "여름용 작은 가방" → "여름 작은 가방 입니다"
+                - "운동할 때 신는 신발" → "운동할때 신는 신발 입니다"  
+                - "겨울 따뜻한 외투" → "겨울 따뜻한 외투 입니다"
                 
                 **잘못된 예시 (키워드 나열):**
                 - "여름 작은 가방 쿨 소재 여성" (X)
                 - "운동 신발 편안한" (X)
                 - "겨울 외투 따뜻한" (X)
 
+                
+            [Category Top3: 쇼핑몰 카테고리 Top3 후보 생성]
+                사용자가 찾고자 하는 상품을 이해하고, 국내 쇼핑몰에서 실제로 사용할 법한 카테고리 명칭 Top3를 생성하세요.
+
+                **역할:**
+                - 검색 엔진이 카테고리 필터를 걸 수 있도록, "가장 가능성 높은 카테고리 3개"를 점수 순으로 나열합니다.
+                - 각 카테고리는 쇼핑몰에서 흔히 쓰는 "대분류>중분류>소분류" 형식을 우선합니다.
+                  예) "식품>과자/스낵>감자칩", "패션잡화>가방>크로스백"
+
+                **요구사항:**
+                1) 정확히 3개 생성: Top1, Top2, Top3
+                2) 서로 다른 카테고리일 것(완전히 동일한 문자열 금지)
+                3) 브랜드/트렌드/마케팅 단어 금지: “다양한, 트렌드, 제품, 합리적, 프리미엄, 스타일리시, 최적” 등
+                4) 문장형 설명 금지: 카테고리 이름만 사용(“입니다/추천/찾기 좋은/검색어” 등 문장형 금지)
+                5) 핵심 품목이 다소 애매할 경우,
+                   - 과도하게 세분화된 소분류로 날조하지 말고
+                   - 비교적 상위 레벨(대분류/중분류 중심)에서 보수적으로 추론할 것.
+                6) 부정/제외 표현(제외/빼고/말고/without 등)은 **카테고리 명칭에는 반영하지 말 것.**
+
+                **예시:**
+                - 입력: "여름용 작은 가방"
+                  → Category Top3:
+                    "패션잡화>가방>크로스백 | 패션잡화>가방>미니백 | 패션잡화>가방>숄더백"
+
 
             [출력 규칙(반드시 정확히 준수)]
             오직 세 줄만 출력, 따옴표 포함. 추가 설명/불릿/번호/코드블록 절대 금지.
             Raw Query: "<query>"
-            Preprocessed Query: "<전처리된_쿼리(핵심 품목 + 유의미 속성만, ‘용’ 제거 후 표준형)> 정말 찾고자 하는 단어는 2개를 쓴다."
-            Category Search Text: "<상품을_완전한_문장으로_설명하는_자연스러운_한국어_문장>"
+            Preprocessed Query: "<전처리된_쿼리(핵심 품목 + 유의미 속성만, ‘용’ 제거 후 표준형)>"
+            Category Search Text: "<예상1순위카테고리> <요약 문장>"
             Doc2Query: "<q1> | <q2> | <q3> | <q4> | <q5> | <q6>"
+            Category Top3: "<Top1_카테고리> | <Top2_카테고리> | <Top3_카테고리>"
 
         """    
     )
@@ -2562,6 +2979,40 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             print(f"[Error] Category Search Text 추출 오류: {e}")
             return ""
     
+
+
+
+    def extract_category_top3(response_text: str):
+        """
+        LLM 응답 전체 문자열에서
+        Category Top3: "<c1> | <c2> | <c3>"
+        이 한 줄을 찾아서 [c1, c2, c3] 리스트로 반환
+        """
+        lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+        
+        cat_line = None
+        for line in lines:
+            if line.startswith("Category Top3:"):
+                cat_line = line
+                break
+
+        if cat_line is None:
+            return []
+
+        # Category Top3: " ... "
+        m = re.search(r'Category Top3:\s*"(.*)"', cat_line)
+        if not m:
+            return []
+
+        raw = m.group(1)  # "<Top1> | <Top2> | <Top3>" 안쪽 내용
+        cats = [c.strip() for c in raw.split("|") if c.strip()]
+
+        # 길이 보정 (3개 미만이면 None 채워넣을 수도 있음)
+        while len(cats) < 3:
+            cats.append(None)
+
+        top1, top2, top3 = cats[:3]
+        return top1, top2, top3
 
 
 
@@ -2720,7 +3171,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 #     # --- Doc2Query 추출 및 정리 (preprocessed_query와 동일한 위치에서 이어서) end---
 
 
-
+    top1, top2, top3 = extract_category_top3(llm_response)
     category_search_text = extract_category_text_new(llm_response)
     terms = extract_preprocessed(llm_response, query)
     terms = remove_direct_search_keywords(terms)
@@ -2729,7 +3180,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # 🔥 여기에 추가!
     preprocessed_query = remove_direct_search_keywords(preprocessed_query)
     category_search_text = remove_direct_search_keywords(category_search_text)
-
     print(f"[Debug] 바로검색 키워드 최종 제거: '{preprocessed_query}'")
 
     # # ===== Doc2Query 상위 2~3개를 Preprocessed Query에 합치기 =====
@@ -2748,20 +3198,19 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         print(f"[Debug] 크기 조건 감지됨, 기존 가격 조건 유지: {price_cond if price_cond else '제한 없음'}")
     else:
         print(f"[Debug] LLM 전처리된 쿼리에서 가격 조건 없음, 기존 조건 유지: {price_cond if price_cond else '제한 없음'}")
-    
-    # �🔥 맥락 반영 검증
+
     print(f"[맥락반영검증] 원본 입력: '{query}'")
     print(f"[맥락반영검증] LLM 처리 결과: '{preprocessed_query}'")
     print(f"[맥락반영검증] 맥락 반영 여부: {'✅ 반영됨' if query != preprocessed_query else '❌ 미반영'}")
 
-    # Category Search Text가 비어있으면 preprocessed_query를 폴백으로 사용
     if not category_search_text or not isinstance(category_search_text, str) or not category_search_text.strip():
         print(f"[Fallback] Category Search Text가 비어있음, preprocessed_query 사용: '{preprocessed_query}'")
         category_search_text = preprocessed_query
 
     print("[Debug] Preprocessed Query_Before ->", terms)
-    print("[Debug] Preprocessed Query ->", preprocessed_query)   #마이너스 같은걸 빼줌.
+    print("[Debug] Preprocessed Query ->", preprocessed_query)
     print("[Debug] Category Search Text ->", category_search_text)
+
 
  
 
@@ -2776,7 +3225,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     
     # 요약 문장으로 카테고리 벡터 검색 수행 (get_top_categories 사용)
     try:
-        category_names = get_top_categories(category_search_text)  # 상위 3개 카테고리 가져오기
+        category_names = get_top_categories(top1,top2,top3,category_search_text)  # 상위 3개 카테고리 가져오기
         print(f"[Debug] get_top_categories 결과: {len(category_names)}개")
         
         # 기존 형식에 맞춰 변환
@@ -2911,15 +3360,18 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-    # 1) 전 카테고리 1000개 벡터 검색 (global_top3 제외)
-    print("\n[방법1/RRF] 1000개 벡터 검색 시작 (방법2 카테고리 제외)")
+    # # 1) 전 카테고리 1000개 벡터 검색 (global_top3 제외)
+    # print("\n[방법1/RRF] 1000개 벡터 검색 시작 (방법2 카테고리 제외)")
 
-    # global_top3에서 제외할 카테고리명 추출
-    excluded_categories = [item.get("name", "") for item in global_top3 if item.get("name")]
-    print(f"[Debug] 제외할 카테고리: {excluded_categories}")
+    # # global_top3에서 제외할 카테고리명 추출
+    # excluded_categories = [item.get("name", "") for item in global_top3 if item.get("name")]
+    # print(f"[Debug] 제외할 카테고리: {excluded_categories}")
 
     # 검색 조건 구성
     search_conditions = []
+
+    fuzz_number = 85
+
 
     # 가격/크기 조건 처리
     if price_cond and not price_cond.startswith("SIZE_CONDITION_"):
@@ -2950,29 +3402,31 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             print(f"[Debug] SIZE_CONDITION 파싱 오류: {e}")
             print(f"[Debug] SIZE_CONDITION 무시: {price_cond}")
 
-    # 카테고리 제외 조건 추가 (Milvus 호환 문법 사용)
-    if excluded_categories:
-        # 빈 문자열 제거 및 정제
-        valid_categories = [cat.strip() for cat in excluded_categories if cat.strip()]
+    # # 카테고리 제외 조건 추가 (Milvus 호환 문법 사용)
+    # if excluded_categories:
+    #     # 빈 문자열 제거 및 정제
+    #     valid_categories = [cat.strip() for cat in excluded_categories if cat.strip()]
         
-        if valid_categories:
-            # Milvus에서 지원하는 not in 연산자 사용
-            if len(valid_categories) == 1:
-                category_exclude_expr = f"category_name != '{valid_categories[0]}'"
-            else:
-                category_list = "', '".join(valid_categories)
-                category_exclude_expr = f"category_name not in ['{category_list}']"
+    #     if valid_categories:
+    #         # Milvus에서 지원하는 not in 연산자 사용
+    #         if len(valid_categories) == 1:
+    #             category_exclude_expr = f"category_name != '{valid_categories[0]}'"
+    #         else:
+    #             category_list = "', '".join(valid_categories)
+    #             category_exclude_expr = f"category_name not in ['{category_list}']"
             
-            search_conditions.append(category_exclude_expr)    # 최종 검색 조건 생성
+    #         search_conditions.append(category_exclude_expr)    # 최종 검색 조건 생성
     final_search_expr = " && ".join(search_conditions) if search_conditions else None
 
     print(f"[Debug] 방법1 검색 조건: {final_search_expr}")
 
 
+
+
     vector_hits_1000 = collection.search(
         data=[q_vec],
         anns_field="emb",
-        param={"metric_type":"L2","params":{"nprobe":64}},
+        param={"metric_type":"L2","params":{"nprobe":128}},
         limit=1000,
         expr=final_search_expr,  # 가격 조건 추가
         output_fields=[
@@ -2983,8 +3437,17 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         ]
     )
 
+
+
+
+
+
+
+
+
+
     # 검색 결과 -> dict 리스트
-    # 상품 제목이 80% 같으면 상품제목 중복제거 추가1
+    # 상품 제목이 fuzz_number 같으면 상품제목 중복제거 추가1
     vector_items = []
     for hits in vector_hits_1000:
         for idx, hit in enumerate(hits):
@@ -2994,7 +3457,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
             title = item.get("제목", "")
             # difflib → RapidFuzz로 변경
-            if any(fuzz.ratio(title, v.get("제목", "")) >= 45 for v in vector_items):
+            if any(fuzz.ratio(title, v.get("제목", "")) >= fuzz_number for v in vector_items):
                 continue
 
             vector_items.append(item)
@@ -3198,7 +3661,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             )
 
             # 검색 결과 -> dict 리스트
-            # 상품 제목이 80% 같으면 상품제목 중복제거 추가2
+            # 상품 제목이 fuzz_number 같으면 상품제목 중복제거 추가2
             items = []
             for hits in vector_hits:
                 for idx, hit in enumerate(hits):
@@ -3208,7 +3671,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
                     title = item.get("제목", "")
                     # difflib → RapidFuzz로 변경
-                    if any(fuzz.ratio(title, v.get("제목", "")) >= 45 for v in items):
+                    if any(fuzz.ratio(title, v.get("제목", "")) >= fuzz_number for v in items):
                         continue
 
                     items.append(item)
@@ -3406,11 +3869,11 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 if not c or c in used_codes or c in seen_codes:
                     continue
                     
-                # 제목 중복 체크 (45% 유사도 기준)
+                # 제목 중복 체크
                 if title:
                     is_duplicate = False
                     for existing_title in seen_titles:
-                        if fuzz.ratio(title, existing_title) >= 45:
+                        if fuzz.ratio(title, existing_title) >= fuzz_number:
                             is_duplicate = True
                             break
                     
@@ -3439,7 +3902,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     total_m2 = 0
     total_m1 = 0
     
-    for set_num in range(5):
+    for set_num in range(3):    #세트 몇개 구성 할지?
         print(f"\n[세트 {set_num + 1}] 백필 시작")
         set_items = []
     
@@ -3500,7 +3963,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     if title:
                         for existing_item in set_items:
                             existing_title = existing_item.get("제목", "").strip()
-                            if existing_title and fuzz.ratio(title, existing_title) >= 45:
+                            if existing_title and fuzz.ratio(title, existing_title) >= fuzz_number:
                                 title_duplicate = True
                                 break
                     
@@ -3527,7 +3990,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     if title:
                         for existing_item in set_items:
                             existing_title = existing_item.get("제목", "").strip()
-                            if existing_title and fuzz.ratio(title, existing_title) >= 45:
+                            if existing_title and fuzz.ratio(title, existing_title) >= fuzz_number:
                                 title_duplicate = True
                                 break
                     
@@ -3544,10 +4007,29 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         final_results.extend(set_items)
         print(f"[세트 {set_num + 1}] 최종: {len(set_items)}개 (누적 총 {len(final_results)}개)")
     
-    print(f"\n[최종표시] 총 {len(final_results)}개 (M2={total_m2}, M1={total_m1})")
-    print(f"[비율] 방법2: {total_m2/len(final_results)*100:.1f}%, 방법1: {total_m1/len(final_results)*100:.1f}%")
-
     
+    total_count = len(final_results)
+    print(f"\n[최종표시] 총 {len(final_results)}개 (M2={total_m2}, M1={total_m1})")
+    if total_count > 0:
+        print(f"[비율] 방법2: {total_m2/len(final_results)*100:.1f}%, 방법1: {total_m1/len(final_results)*100:.1f}%")
+    else:
+        # ✅ 0건일 때 즉시 사용자 안내 반환
+        nores_msg = "No search results. Please specify your search terms more or search for other conditions."
+        try:
+            session_history.add_ai_message(nores_msg)
+        except Exception:
+            pass
+        return {
+            "query": query,
+            "UserMessage": nores_msg,
+            "RawContext": [m.content for m in session_history.messages],
+            "results": [],
+            "combined_message_text": nores_msg,
+            "message_history": [
+                {"type": type(msg).__name__, "content": getattr(msg, "content", "")}
+                for msg in session_history.messages
+            ]
+        }
 
 
 
@@ -3617,131 +4099,300 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     # 결과 출력
     print(f"\n총 {len(final_results)}개의 상품이 최종 리스트에 저장되었습니다.")
+
+
+
+
+
+
+
+
+
+    # # 🎯 LLM 리랭킹: 상위 10개 상품을 사용자 쿼리에 맞게 재정렬
+    # top_10_products = final_results[:10]
     
-    # 🎯 LLM 리랭킹: 상위 10개 상품을 사용자 쿼리에 맞게 재정렬
-    top_10_products = final_results[:10]
+    # # 리랭킹용 프롬프트 생성
+    # products_for_ranking = []
+    # for idx, item in enumerate(top_10_products):
+    #     products_for_ranking.append(f"{idx}. {item['제목']}")
     
-    # 리랭킹용 프롬프트 생성
-    products_for_ranking = []
-    for idx, item in enumerate(top_10_products):
-        products_for_ranking.append(f"{idx}. {item['제목']}")
+    # # 🎯 리랭킹용 쿼리 선택: 누적쿼리 우선 사용
+    # if len(user_query_parts) > 1 and combined_query != query:
+    #     ranking_query = combined_query  # 누적된 대화 맥락 활용
+    #     query_type = "누적쿼리"
+    # else:
+    #     ranking_query = query  # 단일 질문인 경우 원본 쿼리
+    #     query_type = "원본쿼리"
     
-    # 🎯 리랭킹용 쿼리 선택: 누적쿼리 우선 사용
-    if len(user_query_parts) > 1 and combined_query != query:
-        ranking_query = combined_query  # 누적된 대화 맥락 활용
+    # print(f"[LLM 리랭킹] {query_type} 사용: '{ranking_query}'")
+    
+    # # 🔍 리랭킹 전 상품 제목들 출력
+    # print(f"\n{'='*60}")
+    # print(f"📋 [리랭킹 전] 상위 10개 상품 제목:")
+    # print(f"{'='*60}")
+    # for idx, item in enumerate(top_10_products):
+    #     print(f"{idx}. {item['제목']}")
+    # print(f"{'='*60}")
+    
+    # # 🛡️ 안전장치: 상품이 10개 미만인 경우 처리   
+    # if len(top_10_products) < 10:
+    #     print(f"[LLM 리랭킹] 상품 수 부족 ({len(top_10_products)}개) → 리랭킹 스킵")
+    #     # 리랭킹 없이 원본 순서 유지
+    #     print(f"\n{'='*60}")
+    #     print(f"⚠️ [리랭킹 스킵] 상품 수 부족으로 원본 순서 유지:")
+    #     print(f"{'='*60}")
+    #     for idx, item in enumerate(top_10_products):
+    #         print(f"{idx}. {item['제목']}")
+    #     print(f"{'='*60}")
+    # else:
+    #     ranking_prompt = f"""사용자 검색: "{ranking_query}"
+
+    #                         상품 목록:
+    #                         {chr(10).join(products_for_ranking)}
+
+    #                         지시사항: 위 10개 상품을 사용자 검색 의도에 맞게 재정렬하세요.
+    #                         응답은 반드시 다음 형식으로만 답변: 0,1,2,3,4,5,6,7,8,9
+
+    #                         예시: 2,0,5,1,8,3,7,4,9,6
+
+    #                         답변:
+    #                     """
+
+    # try:
+    #     # LLM으로 리랭킹 순서 받기
+    #     rerank_response = client.chat.completions.create(
+    #         model=LLM_MODEL,
+    #         messages=[
+    #             {"role": "system", "content": "You must respond with ONLY numbers and commas. No other text allowed."},
+    #             {"role": "user", "content": ranking_prompt}
+    #         ],
+    #         temperature=0.1,
+    #         max_tokens=50
+    #     )
+        
+    #     rerank_order = rerank_response.choices[0].message.content.strip()
+    #     print(f"[LLM 리랭킹] LLM 응답: '{rerank_order}'")
+        
+    #     # 🛡️ 강화된 파싱 로직
+    #     # 1. "없음" 패턴 감지
+    #     if "없음" in rerank_order or "해당" in rerank_order or "적절" in rerank_order:
+    #         print(f"[LLM 리랭킹] '없음' 패턴 감지 → 원본 순서 유지")
+    #         raise ValueError("LLM이 '없음' 응답 반환")
+        
+    #     # 2. 숫자와 쉼표만 추출
+    #     numbers_only = re.findall(r'\d+', rerank_order)
+    #     print(f"[LLM 리랭킹] 추출된 숫자들: {numbers_only}")
+        
+    #     # 3. 정확히 10개 숫자인지 확인
+    #     if len(numbers_only) != 10:
+    #         print(f"[LLM 리랭킹] 숫자 개수 오류 ({len(numbers_only)}개) → 원본 순서 유지")
+    #         raise ValueError(f"숫자 개수가 10개가 아님: {len(numbers_only)}개")
+        
+    #     # 4. 숫자 범위 검증 (0-9)
+    #     order_indices = [int(x) for x in numbers_only]
+    #     if not all(0 <= x <= 9 for x in order_indices):
+    #         print(f"[LLM 리랭킹] 숫자 범위 오류 → 원본 순서 유지")
+    #         raise ValueError("숫자가 0-9 범위를 벗어남")
+        
+    #     # 5. 중복 숫자 검증
+    #     if len(set(order_indices)) != 10:
+    #         print(f"[LLM 리랭킹] 중복 숫자 감지 → 원본 순서 유지")
+    #         raise ValueError("중복된 숫자 존재")
+            
+    #     print(f"[LLM 리랭킹] 파싱된 순서: {order_indices}")
+        
+    #     # 리랭킹 적용
+    #     reranked_products = [top_10_products[i] for i in order_indices]
+    #     final_results[:10] = reranked_products  # 상위 10개만 교체
+    #     print(f"[LLM 리랭킹] 성공적으로 재정렬됨")
+        
+    #     # 🔍 리랭킹 후 상품 제목들 출력
+    #     print(f"\n{'='*60}")
+    #     print(f"🎯 [리랭킹 후] 재정렬된 상위 10개 상품 제목:")
+    #     print(f"{'='*60}")
+    #     for idx, item in enumerate(reranked_products):
+    #         print(f"{idx}. {item['제목']}")
+    #     print(f"{'='*60}")
+                
+    # except (ValueError, IndexError) as e:
+    #     print(f"[LLM 리랭킹] 파싱 오류: {e} → 원본 순서 유지")
+    #     print(f"🔍 원본 순서 그대로 사용")
+        
+    # except Exception as e:
+    #     print(f"[LLM 리랭킹] 일반 오류: {e} → 원본 순서 유지")
+    #     print(f"\n{'='*60}")
+    #     print(f"⚠️ [리랭킹 실패] 원본 순서 그대로 사용:")
+    #     print(f"{'='*60}")
+    #     for idx, item in enumerate(top_10_products):
+    #         print(f"{idx}. {item['제목']}")
+    #     print(f"{'='*60}")
+    
+    # print("\n🎯 최종 리랭킹된 상위 10개 상품:")
+    # for idx, item in enumerate(final_results[:10], 1):
+    #     print(f"\n{idx}. {item['제목']}")
+    #     print(f"   카테고리: {item['카테고리']}")
+    #     print(f"   가격: {item['가격']:,}원")
+
+
+
+    def rerank_block_with_llm(block_products, ranking_query: str, block_name: str = ""):
+        """
+        block_products: final_results의 일부 (길이 보통 10개)
+        ranking_query: combined_query / query 그대로 사용
+        """
+        print(f"\n{'='*60}")
+        print(f"🎯 [LLM 리랭킹 블록] {block_name} 상품 수: {len(block_products)}개")
+        print(f"{'='*60}")
+
+        # 상품이 10개 미만이면 그냥 스킵 (원본 유지)
+        if len(block_products) < 10:
+            print(f"[LLM 리랭킹] {block_name} 상품 수 부족({len(block_products)}개) → 리랭킹 스킵")
+            return block_products
+
+        # LLM에 넘길용 텍스트 구성
+        products_for_ranking = [
+            f"{idx}. {item['제목']}"
+            for idx, item in enumerate(block_products)
+        ]
+
+        ranking_prompt = f"""사용자 검색: "{ranking_query}"
+
+        상품 목록:
+        {chr(10).join(products_for_ranking)}
+
+        지시사항: 위 10개 상품을 사용자 검색 의도에 맞게 재정렬하세요.
+        응답은 반드시 다음 형식으로만 답변: 0,1,2,3,4,5,6,7,8,9
+
+        예시: 2,0,5,1,8,3,7,4,9,6
+
+        답변:
+        """
+
+        try:
+            rerank_response = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You must respond with ONLY numbers and commas. No other text allowed."
+                    },
+                    {"role": "user", "content": ranking_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=50
+            )
+
+            rerank_order = rerank_response.choices[0].message.content.strip()
+            print(f"[LLM 리랭킹] {block_name} LLM 응답: '{rerank_order}'")
+
+            # '없음' 계열 응답 방어
+            if "없음" in rerank_order or "해당" in rerank_order or "적절" in rerank_order:
+                print(f"[LLM 리랭킹] {block_name} '없음' 패턴 감지 → 원본 순서 유지")
+                raise ValueError("LLM이 '없음' 응답 반환")
+
+            numbers_only = re.findall(r'\d+', rerank_order)
+            print(f"[LLM 리랭킹] {block_name} 추출된 숫자들: {numbers_only}")
+
+            # 정확히 10개 숫자인지 확인
+            if len(numbers_only) != 10:
+                print(f"[LLM 리랭킹] {block_name} 숫자 개수 오류 ({len(numbers_only)}개) → 원본 순서 유지")
+                raise ValueError(f"숫자 개수가 10개가 아님: {len(numbers_only)}개")
+
+            order_indices = [int(x) for x in numbers_only]
+
+            # 0~9 범위 체크
+            if not all(0 <= x <= 9 for x in order_indices):
+                print(f"[LLM 리랭킹] {block_name} 숫자 범위 오류 → 원본 순서 유지")
+                raise ValueError("숫자가 0-9 범위를 벗어남")
+
+            # 중복 체크
+            if len(set(order_indices)) != 10:
+                print(f"[LLM 리랭킹] {block_name} 중복 숫자 감지 → 원본 순서 유지")
+                raise ValueError("중복된 숫자 존재")
+
+            print(f"[LLM 리랭킹] {block_name} 파싱된 순서: {order_indices}")
+
+            reranked_block = [block_products[i] for i in order_indices]
+            print(f"[LLM 리랭킹] {block_name} 성공적으로 재정렬됨")
+
+            # 디버그 출력
+            print(f"\n{'='*60}")
+            print(f"🎯 [리랭킹 후] {block_name} 재정렬된 상품 제목:")
+            print(f"{'='*60}")
+            for idx, item in enumerate(reranked_block):
+                print(f"{idx}. {item['제목']}")
+            print(f"{'='*60}")
+
+            return reranked_block
+
+        except Exception as e:
+            print(f"[LLM 리랭킹] {block_name} 오류: {e} → 이 블록은 원본 순서 유지")
+            return block_products
+
+
+
+
+
+    # 🎯 LLM 리랭킹: 상위 30개를 10개씩 3세트로 재정렬
+    # 1) 리랭킹용 쿼리 선택
+    
+    # ✅ 우선순위: preprocessed_query > combined_query > query
+    if preprocessed_query and len(preprocessed_query.strip()) > 2:
+        ranking_query = preprocessed_query  # LLM이 정제한 쿼리 (최우선)
+        query_type = "전처리쿼리"
+    elif len(user_query_parts) > 1 and combined_query != query:
+        ranking_query = combined_query      # 누적된 대화 맥락
         query_type = "누적쿼리"
     else:
-        ranking_query = query  # 단일 질문인 경우 원본 쿼리
+        ranking_query = query               # 원본 쿼리 (폴백)
         query_type = "원본쿼리"
-    
+
     print(f"[LLM 리랭킹] {query_type} 사용: '{ranking_query}'")
-    
-    # 🔍 리랭킹 전 상품 제목들 출력
+    print(f"[LLM 리랭킹] 비교 - 원본: '{query}' / 누적: '{combined_query}' / 전처리: '{preprocessed_query}'")
+
+    # 2) 디버깅용: 리랭킹 전 상위 10개만 일단 출력 (원래 하던 것 유지)
+    top_10_products = final_results[:10]
     print(f"\n{'='*60}")
     print(f"📋 [리랭킹 전] 상위 10개 상품 제목:")
     print(f"{'='*60}")
     for idx, item in enumerate(top_10_products):
         print(f"{idx}. {item['제목']}")
     print(f"{'='*60}")
-    
-    # 🛡️ 안전장치: 상품이 10개 미만인 경우 처리   
-    if len(top_10_products) < 10:
-        print(f"[LLM 리랭킹] 상품 수 부족 ({len(top_10_products)}개) → 리랭킹 스킵")
-        # 리랭킹 없이 원본 순서 유지
-        print(f"\n{'='*60}")
-        print(f"⚠️ [리랭킹 스킵] 상품 수 부족으로 원본 순서 유지:")
-        print(f"{'='*60}")
-        for idx, item in enumerate(top_10_products):
-            print(f"{idx}. {item['제목']}")
-        print(f"{'='*60}")
-    else:
-        ranking_prompt = f"""사용자 검색: "{ranking_query}"
 
-                            상품 목록:
-                            {chr(10).join(products_for_ranking)}
+    # 3) 세트 나누기
+    block1 = final_results[0:10]   # 1~10위
+    block2 = final_results[10:20]  # 11~20위
+    block3 = final_results[20:30]  # 21~30위
 
-                            지시사항: 위 10개 상품을 사용자 검색 의도에 맞게 재정렬하세요.
-                            응답은 반드시 다음 형식으로만 답변: 0,1,2,3,4,5,6,7,8,9
+    # 4) 세트별 리랭킹 (LLM 3번 호출)
+    block1_r = rerank_block_with_llm(block1, ranking_query, "1세트 (1~10위)")
+    block2_r = rerank_block_with_llm(block2, ranking_query, "2세트 (11~20위)")
+    block3_r = rerank_block_with_llm(block3, ranking_query, "3세트 (21~30위)")
 
-                            예시: 2,0,5,1,8,3,7,4,9,6
 
-                            답변:
-                        """
+    # 5) 리랭킹 결과를 final_results에 다시 반영
+    final_results[0:0+len(block1_r)] = block1_r
+    final_results[10:10+len(block2_r)] = block2_r
+    final_results[20:20+len(block3_r)] = block3_r
 
-    try:
-        # LLM으로 리랭킹 순서 받기
-        rerank_response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "You must respond with ONLY numbers and commas. No other text allowed."},
-                {"role": "user", "content": ranking_prompt}
-            ],
-            temperature=0.1,
-            max_tokens=50
-        )
-        
-        rerank_order = rerank_response.choices[0].message.content.strip()
-        print(f"[LLM 리랭킹] LLM 응답: '{rerank_order}'")
-        
-        # 🛡️ 강화된 파싱 로직
-        # 1. "없음" 패턴 감지
-        if "없음" in rerank_order or "해당" in rerank_order or "적절" in rerank_order:
-            print(f"[LLM 리랭킹] '없음' 패턴 감지 → 원본 순서 유지")
-            raise ValueError("LLM이 '없음' 응답 반환")
-        
-        # 2. 숫자와 쉼표만 추출
-        numbers_only = re.findall(r'\d+', rerank_order)
-        print(f"[LLM 리랭킹] 추출된 숫자들: {numbers_only}")
-        
-        # 3. 정확히 10개 숫자인지 확인
-        if len(numbers_only) != 10:
-            print(f"[LLM 리랭킹] 숫자 개수 오류 ({len(numbers_only)}개) → 원본 순서 유지")
-            raise ValueError(f"숫자 개수가 10개가 아님: {len(numbers_only)}개")
-        
-        # 4. 숫자 범위 검증 (0-9)
-        order_indices = [int(x) for x in numbers_only]
-        if not all(0 <= x <= 9 for x in order_indices):
-            print(f"[LLM 리랭킹] 숫자 범위 오류 → 원본 순서 유지")
-            raise ValueError("숫자가 0-9 범위를 벗어남")
-        
-        # 5. 중복 숫자 검증
-        if len(set(order_indices)) != 10:
-            print(f"[LLM 리랭킹] 중복 숫자 감지 → 원본 순서 유지")
-            raise ValueError("중복된 숫자 존재")
-            
-        print(f"[LLM 리랭킹] 파싱된 순서: {order_indices}")
-        
-        # 리랭킹 적용
-        reranked_products = [top_10_products[i] for i in order_indices]
-        final_results[:10] = reranked_products  # 상위 10개만 교체
-        print(f"[LLM 리랭킹] 성공적으로 재정렬됨")
-        
-        # 🔍 리랭킹 후 상품 제목들 출력
-        print(f"\n{'='*60}")
-        print(f"🎯 [리랭킹 후] 재정렬된 상위 10개 상품 제목:")
-        print(f"{'='*60}")
-        for idx, item in enumerate(reranked_products):
-            print(f"{idx}. {item['제목']}")
-        print(f"{'='*60}")
-                
-    except (ValueError, IndexError) as e:
-        print(f"[LLM 리랭킹] 파싱 오류: {e} → 원본 순서 유지")
-        print(f"🔍 원본 순서 그대로 사용")
-        
-    except Exception as e:
-        print(f"[LLM 리랭킹] 일반 오류: {e} → 원본 순서 유지")
-        print(f"\n{'='*60}")
-        print(f"⚠️ [리랭킹 실패] 원본 순서 그대로 사용:")
-        print(f"{'='*60}")
-        for idx, item in enumerate(top_10_products):
-            print(f"{idx}. {item['제목']}")
-        print(f"{'='*60}")
-    
-    print("\n🎯 최종 리랭킹된 상위 10개 상품:")
-    for idx, item in enumerate(final_results[:10], 1):
-        print(f"\n{idx}. {item['제목']}")
-        print(f"   카테고리: {item['카테고리']}")
-        print(f"   가격: {item['가격']:,}원")
+    # # 6) 최종 상위 10개 출력 (기존 출력 로직 재사용) - TEST 출력용 실사용시 프린트 문 주석 or 제거 처리 필요
+    # print("\n🎯 최종 리랭킹된 상위 30개 상품:")
+    # for idx, item in enumerate(final_results[:30], 1):
+    #     print(f"\n{idx}. {item['제목']}")
+    #     print(f"   카테고리: {item['카테고리']}")
+    #     print(f"   가격: {item['가격']:,}원")
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     # 상품 캐시에 저장 (final_results 기준)
