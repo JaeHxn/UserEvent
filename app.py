@@ -3632,16 +3632,12 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             seen_codes.add(code)
             final_results.append(it)
 
-    method1_all_sets = []
-    for i in range(0, len(final_results), 10):
-        block = final_results[i:i+10]
-        if len(block) == 10:
-            method1_all_sets.append(block)
+    method1_all_sets = final_results  # 리스트 그대로 (40개 아이템)
+    print(f"\n[방법1/RRF] 상위 {len(method1_all_sets)}개 선택 완료")
 
-    print(f"\n[방법1/RRF] 세트 수: {len(method1_all_sets)}  (총 {sum(len(s) for s in method1_all_sets)}개)")
     if method1_all_sets:
         print("\n[방법1/RRF] 세트1 미리보기 (RRF최종 점수로 Sort완료)")
-        for idx, it in enumerate(method1_all_sets[0], 1):
+        for idx, it in enumerate(method1_all_sets[:10], 1):
             print(
                 f"{idx}. {it['제목']} | {it['카테고리']} | {it['가격']:,}원 | "
                 f"vecRRF={it['rrf_vec']:.6f} | titleRRF={it['rrf_title']:.6f} | "
@@ -3649,16 +3645,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 f"RRF(mean-2)={it['rrf_all']:.6f}"
             )
 
-        # ✅ 세트가 2개 이상일 때만 세트2 출력 (IndexError 방지)
-        if len(method1_all_sets) >= 2:
-            print("\n[방법1/RRF] 세트2 미리보기 (RRF최종 점수로 Sort완료)")
-            for idx, it in enumerate(method1_all_sets[1], 1):
-                print(
-                    f"{idx}. {it['제목']} | {it['카테고리']} | {it['가격']:,}원 | "
-                    f"vecRRF={it['rrf_vec']:.6f} | titleRRF={it['rrf_title']:.6f} |  "
-                    f"vec≈{it['vecScore1000']:.1f} / title≈{it['titleScore1000']:.1f}| "
-                    f"RRF(mean-2)={it['rrf_all']:.6f}"
-                )
+
 
 
 
@@ -3829,43 +3816,85 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         top3_list = top3_results[:40]  # 상위 40개만
         print(f"[방법2] Top3 ({top3_category}): {len(top3_results)}개 중 40개 선택")
 
-    # 방법2 결과를 10개씩 세트로 구성 (2:2:1 비율 유지)
+
+
+
+
+    # ===== 방법2 구성 설정 =====
+    METHOD2_TOP1_COUNT = 3  # Top1 카테고리에서 가져올 개수 (기존 2개 → 3개)
+    METHOD2_TOP2_COUNT = 3  # Top2 카테고리에서 가져올 개수 (기존 2개 → 3개)  
+    METHOD2_TOP3_COUNT = 2  # Top3 카테고리에서 가져올 개수 (기존 1개 → 2개)
+    METHOD2_ITEMS_PER_SET = METHOD2_TOP1_COUNT + METHOD2_TOP2_COUNT + METHOD2_TOP3_COUNT  # 세트당 총 개수 (8개)
+    METHOD2_TOTAL_FETCH = 40  # 각 카테고리에서 미리 가져올 총 개수
+
+    print(f"[방법2 설정] Top1:{METHOD2_TOP1_COUNT}개 + Top2:{METHOD2_TOP2_COUNT}개 + Top3:{METHOD2_TOP3_COUNT}개 = 총 {METHOD2_ITEMS_PER_SET}개/세트")
+
+    # ... existing code (search_by_category_method2 함수는 그대로 유지) ...
+
+    # 방법2 결과를 세트로 구성 (3:3:2 비율)
     method2_all_sets = []
+
+    # 사이클 수 계산
+    max_cycles = min(
+        len(top1_list) // METHOD2_TOP1_COUNT if METHOD2_TOP1_COUNT > 0 else 0,
+        len(top2_list) // METHOD2_TOP2_COUNT if METHOD2_TOP2_COUNT > 0 else 0,
+        len(top3_list) // METHOD2_TOP3_COUNT if METHOD2_TOP3_COUNT > 0 else 0,
+        10  # 최대 10사이클
+    )
+
+
     
-    # 10싸이클 생성 (각 싸이클마다 2:2:1 비율로 5개씩)
-    for cycle in range(10):
+    print(f"[방법2] 최대 {max_cycles}개 사이클 생성 가능")
+
+    for cycle in range(max_cycles):
         cycle_items = []
         
-        # Top1에서 2개 (cycle*2 인덱스부터)
-        start_idx = cycle * 2
-        if start_idx < len(top1_list) and start_idx + 1 < len(top1_list):
-            cycle_items.extend(top1_list[start_idx:start_idx+2])
-        elif start_idx < len(top1_list):
-            cycle_items.extend(top1_list[start_idx:start_idx+1])
+        # Top1에서 3개 (cycle*3 인덱스부터)
+        start_idx_top1 = cycle * METHOD2_TOP1_COUNT
+        if start_idx_top1 + METHOD2_TOP1_COUNT <= len(top1_list):
+            cycle_items.extend(top1_list[start_idx_top1:start_idx_top1 + METHOD2_TOP1_COUNT])
+        elif start_idx_top1 < len(top1_list):
+            cycle_items.extend(top1_list[start_idx_top1:])
         
-        # Top2에서 2개 (cycle*2 인덱스부터)
-        if start_idx < len(top2_list) and start_idx + 1 < len(top2_list):
-            cycle_items.extend(top2_list[start_idx:start_idx+2])
-        elif start_idx < len(top2_list):
-            cycle_items.extend(top2_list[start_idx:start_idx+1])
+        # Top2에서 3개 (cycle*3 인덱스부터)
+        start_idx_top2 = cycle * METHOD2_TOP2_COUNT
+        if start_idx_top2 + METHOD2_TOP2_COUNT <= len(top2_list):
+            cycle_items.extend(top2_list[start_idx_top2:start_idx_top2 + METHOD2_TOP2_COUNT])
+        elif start_idx_top2 < len(top2_list):
+            cycle_items.extend(top2_list[start_idx_top2:])
         
-        # Top3에서 1개 (cycle 인덱스)
-        if cycle < len(top3_list):
-            cycle_items.extend(top3_list[cycle:cycle+1])
+        # Top3에서 2개 (cycle*2 인덱스부터)
+        start_idx_top3 = cycle * METHOD2_TOP3_COUNT
+        if start_idx_top3 + METHOD2_TOP3_COUNT <= len(top3_list):
+            cycle_items.extend(top3_list[start_idx_top3:start_idx_top3 + METHOD2_TOP3_COUNT])
+        elif start_idx_top3 < len(top3_list):
+            cycle_items.extend(top3_list[start_idx_top3:])
         
-        # 10개 세트가 완성되면 추가 (10개로 채우지 않음!)
-        if len(cycle_items) == 5:  # 정확히 5개인 경우만
+        # 세트 추가 조건
+        if len(cycle_items) == METHOD2_ITEMS_PER_SET:  # 정확히 8개인 경우
             method2_all_sets.append(cycle_items)
-        elif len(cycle_items) >= 3:  # 최소 3개 이상이면 그대로 추가
+            print(f"[방법2] 사이클 {cycle+1}: 완전한 세트 ({METHOD2_ITEMS_PER_SET}개) 추가")
+        elif len(cycle_items) >= METHOD2_ITEMS_PER_SET - 2:  # 최소 6개 이상이면 추가
             method2_all_sets.append(cycle_items)
+            print(f"[방법2] 사이클 {cycle+1}: 부분 세트 ({len(cycle_items)}개) 추가")
 
     print(f"\n[방법2] 총 {len(method2_all_sets)}개 세트 생성됨")
+
     
+
     # 첫 번째 세트 미리보기
     if method2_all_sets:
-        print("\n[방법2] 첫 번째 세트 미리보기:")
+        print(f"\n[방법2] 첫 번째 세트 미리보기 (총 {len(method2_all_sets[0])}개):")
         for idx, item in enumerate(method2_all_sets[0], 1):
-            print(f"  {idx}. {item['제목']} | {item['카테고리']} | {item['가격']:,}원 | {item['검색방식']}")
+            source = ""
+            if idx <= METHOD2_TOP1_COUNT:
+                source = f"Top1-{idx}"
+            elif idx <= METHOD2_TOP1_COUNT + METHOD2_TOP2_COUNT:
+                source = f"Top2-{idx - METHOD2_TOP1_COUNT}"
+            else:
+                source = f"Top3-{idx - METHOD2_TOP1_COUNT - METHOD2_TOP2_COUNT}"
+            
+            print(f"  {idx}. [{source}] {item['제목']} | {item['카테고리']} | {item['가격']:,}원")
     
 
 
@@ -3875,269 +3904,311 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     # #                         NEW 방법 2 end                          #
     # #################################################################
 
-    
 
+    # ===== 15개 후보 생성: 방법2(8) + 방법1(7) =====
+    METHOD1_ITEMS_COUNT = 7  # 방법1에서 가져올 개수 (요구사항)
 
-    
-    final_results = []
-    used_codes = set()
+    # 방법2 첫 세트 8개
+    method2_top8 = method2_all_sets[0] if method2_all_sets else []
+    if len(method2_top8) > METHOD2_ITEMS_PER_SET:
+        method2_top8 = method2_top8[:METHOD2_ITEMS_PER_SET]
+    print(f"[15개 후보] 방법2 첫 세트: {len(method2_top8)}개")
 
-    def norm(code):
-        return (code or "").strip().upper()
-
-    total_m2 = 0
-    total_m1 = 0
-
-    for set_num in range(5):
-        print(f"\n[세트 {set_num + 1}] 생성 시작")
-        set_items = []
-
-        # 1) 방법2 최대 5개
-        method2_added = 0
-        if method2_all_sets and set_num < len(method2_all_sets):
-            for item in method2_all_sets[set_num][:5]:
-                code = norm(item.get('상품코드'))
-                title = item.get("제목", "").strip()
-                
-                # ✅ 상품코드 + 제목 둘 다 체크
-                if code and code not in used_codes:
-                    # 제목 중복 체크 (기존 set_items와 비교)
-                    is_title_duplicate = False
-                    if title:
-                        for existing_item in set_items:
-                            existing_title = existing_item.get("제목", "").strip()
-                            if existing_title and fuzz.ratio(title, existing_title) >= fuzz_number:
-                                is_title_duplicate = True
-                                print(f"[세트 {set_num + 1}] 방법2 제목 중복 제거: '{title[:30]}...'")
-                                break
-                    
-                    if not is_title_duplicate:
-                        set_items.append(item)
-                        used_codes.add(code)
-                        method2_added += 1
-                        total_m2 += 1
-        print(f"[세트 {set_num + 1}] 방법2 결과 {method2_added}개 추가")
-
-        # 2) 방법1로 세트 10개 될 때까지 보충
-        method1_added = 0
-        if method1_all_sets and set_num < len(method1_all_sets):
-            for product in method1_all_sets[set_num]:
-                if len(set_items) >= 10:
-                    break
-                code = norm(product.get('상품코드'))
-                title = product.get("제목", "").strip()
-                
-                # ✅ 상품코드 + 제목 둘 다 체크
-                if code and code not in used_codes:
-                    # 제목 중복 체크 (기존 set_items와 비교)
-                    is_title_duplicate = False
-                    if title:
-                        for existing_item in set_items:
-                            existing_title = existing_item.get("제목", "").strip()
-                            if existing_title and fuzz.ratio(title, existing_title) >= fuzz_number:
-                                is_title_duplicate = True
-                                print(f"[세트 {set_num + 1}] 방법1 제목 중복 제거: '{title[:30]}...'")
-                                break
-                    
-                    if not is_title_duplicate:
-                        set_items.append(product)
-                        used_codes.add(code)
-                        method1_added += 1
-                        total_m1 += 1
-        print(f"[세트 {set_num + 1}] 방법1 결과 {method1_added}개 추가 (중복 제거 후)")
-
-        final_results.extend(set_items)
-        print(f"[세트 {set_num + 1}] 완성: {len(set_items)}개 (누적 총 {len(final_results)}개)")
-
-    # ===== 세트별 균형 백필 =====
-    TARGET_PER_SET = 10
-    
-    def flatten_unique_with_title_check(nested, existing_results):
-        """백필용 중복 제거 함수 (제목 + 상품코드 체크)"""
-        pool, seen_codes, seen_titles = [], set(), set()
-        
-        # 기존 결과의 제목들을 수집
-        for item in existing_results:
-            title = item.get("제목", "")
-            if title:
-                seen_titles.add(title.strip())
-        
-        for block in (nested or []):
-            for x in (block or []):
-                c = norm(x.get('상품코드'))
-                title = x.get("제목", "").strip()
-                
-                if not c or c in used_codes or c in seen_codes:
-                    continue
-                    
-                # 제목 중복 체크
-                if title:
-                    is_duplicate = False
-                    for existing_title in seen_titles:
-                        if fuzz.ratio(title, existing_title) >= fuzz_number:
-                            is_duplicate = True
-                            break
-                    
-                    if is_duplicate:
-                        continue
-                        
-                pool.append(x)
-                seen_codes.add(c)
-                if title:
-                    seen_titles.add(title)
-        
-        return pool
-    
-    # 🎯 핵심 수정: 세트별 개별 백필
-    print(f"\n[세트별 백필] 각 세트를 10개로 균형 맞추기 시작")
-    
-    # 전체 백필 풀 생성 (한 번만)
-    m2_pool = flatten_unique_with_title_check(method2_all_sets, final_results)
-    m1_pool = flatten_unique_with_title_check(method1_all_sets, final_results)
-    
-    print(f"[백필 풀] 방법2: {len(m2_pool)}개, 방법1: {len(m1_pool)}개")
-    
-    # 각 세트별로 개별 백필 수행
-    final_results = []  # 초기화
-    used_codes = set()  # 초기화
-    total_m2 = 0
-    total_m1 = 0
-    
-    for set_num in range(3):    #세트 몇개 구성 할지?
-        print(f"\n[세트 {set_num + 1}] 백필 시작")
-        set_items = []
-    
-        # 1) 기본 방법2 (최대 5개)   
-        method2_added = 0
-        if method2_all_sets and set_num < len(method2_all_sets):
-            for item in method2_all_sets[set_num][:5]:
-                code = norm(item.get('상품코드'))
-                title = (item.get("제목","") or "").strip()
-                if code and code not in used_codes:
-                    # 제목 유사도 중복 체크 (set_items 기준)
-                    is_title_dup = False
-                    if title:
-                        for ex in set_items:
-                            ex_title = (ex.get("제목","") or "").strip()
-                            if ex_title and fuzz.ratio(title, ex_title) >= fuzz_number:   #중복제거 추가.11.25
-                                is_title_dup = True
-                                print(f"[세트 {set_num+1}] 방법2 제목 중복 제거: '{title[:30]}'")
-                                break
-                    if is_title_dup:
-                        continue
-                    set_items.append(item)
-                    used_codes.add(code)
-                    method2_added += 1
-                    total_m2 += 1
-
-        # 2) 기본 방법1 (최대 5개)
-        method1_added = 0
-        if method1_all_sets and set_num < len(method1_all_sets):
-            for product in method1_all_sets[set_num]:
-                if len(set_items) >= 10:
-                    break
-                code = norm(product.get('상품코드'))
-                title = (product.get("제목","") or "").strip()
-                if code and code not in used_codes:
-                    is_title_dup = False
-                    if title:
-                        for ex in set_items:
-                            ex_title = (ex.get("제목","") or "").strip()
-                            if ex_title and fuzz.ratio(title, ex_title) >= fuzz_number:   #중복제거 추가.11.25
-                                is_title_dup = True
-                                print(f"[세트 {set_num+1}] 방법1 제목 중복 제거: '{title[:30]}'")
-                                break
-                    if is_title_dup:
-                        continue
-                    set_items.append(product)
-                    used_codes.add(code)
-                    method1_added += 1
-                    total_m1 += 1
-    
-        current_set_size = len(set_items)
-        print(f"[세트 {set_num + 1}] 기본 구성: {current_set_size}개 (M2={method2_added}, M1={method1_added})")
-    
-        # 🎯 3) 세트별 개별 백필 (10개 미만인 경우)
-        if current_set_size < TARGET_PER_SET:
-            missing = TARGET_PER_SET - current_set_size
-            print(f"[세트 {set_num + 1}] {missing}개 부족 → 세트별 백필 시작")
-        
-            # 🔧 올바른 백필 계산: 각 방법별로 5개까지 채우기
-            current_m2 = method2_added  # 현재 방법2 개수
-            current_m1 = method1_added  # 현재 방법1 개수
-            
-            m2_needed = max(0, 5 - current_m2)  # 방법2에서 5개까지 필요한 개수
-            m1_needed = max(0, 5 - current_m1)  # 방법1에서 5개까지 필요한 개수
-            
-            print(f"[세트 {set_num + 1}] 백필 계획: 방법2({m2_needed}개, 현재:{current_m2}) + 방법1({m1_needed}개, 현재:{current_m1})")
-        
-            # 방법2 백필
-            m2_backfilled = 0
-            # 🔧 수정: 전체 풀에서 사용하지 않은 것들을 찾아서 백필
-            for i, item in enumerate(m2_pool):
-                if m2_backfilled >= m2_needed or len(set_items) >= TARGET_PER_SET:
-                    break
-                    
-                code = norm(item.get('상품코드'))
-                title = item.get("제목", "").strip()
-                
-                if code and code not in used_codes:
-                    # 제목 중복 체크
-                    title_duplicate = False
-                    if title:
-                        for existing_item in set_items:
-                            existing_title = existing_item.get("제목", "").strip()
-                            if existing_title and fuzz.ratio(title, existing_title) >= fuzz_number:
-                                title_duplicate = True
-                                break
-                    
-                    if not title_duplicate:
-                        set_items.append(item)
-                        used_codes.add(code)
-                        m2_backfilled += 1
-                        total_m2 += 1
-                        print(f"[세트 {set_num + 1}] 방법2 백필: {title[:30]}...")
-        
-            # 방법1 백필
-            m1_backfilled = 0
-            # 🔧 수정: 전체 풀에서 사용하지 않은 것들을 찾아서 백필
-            for i, item in enumerate(m1_pool):
-                if m1_backfilled >= m1_needed or len(set_items) >= TARGET_PER_SET:
-                    break
-                    
-                code = norm(item.get('상품코드'))
-                title = item.get("제목", "").strip()
-                
-                if code and code not in used_codes:
-                    # 제목 중복 체크
-                    title_duplicate = False
-                    if title:
-                        for existing_item in set_items:
-                            existing_title = existing_item.get("제목", "").strip()
-                            if existing_title and fuzz.ratio(title, existing_title) >= fuzz_number:
-                                title_duplicate = True
-                                break
-                    
-                    if not title_duplicate:
-                        set_items.append(item)
-                        used_codes.add(code)
-                        m1_backfilled += 1
-                        total_m1 += 1
-                        print(f"[세트 {set_num + 1}] 방법1 백필: {title[:30]}...")
-        
-            print(f"[세트 {set_num + 1}] 백필 완료: 방법2({m2_backfilled}개) + 방법1({m1_backfilled}개)")
-            print(f"[세트 {set_num + 1}] 최종 구성: M2={method2_added + m2_backfilled}개, M1={method1_added + m1_backfilled}개")
-    
-        final_results.extend(set_items)
-        print(f"[세트 {set_num + 1}] 최종: {len(set_items)}개 (누적 총 {len(final_results)}개)")
-    
-    
-    total_count = len(final_results)
-    print(f"\n[최종표시] 총 {len(final_results)}개 (M2={total_m2}, M1={total_m1})")
-    if total_count > 0:
-        print(f"[비율] 방법2: {total_m2/len(final_results)*100:.1f}%, 방법1: {total_m1/len(final_results)*100:.1f}%")
+    # 방법1 상위 7개 (안전하게 처리)
+    if isinstance(method1_all_sets, list):
+        method1_top7 = method1_all_sets[:METHOD1_ITEMS_COUNT]
     else:
-        # ✅ 0건일 때 즉시 사용자 안내 반환
+        # 혹시 딕셔너리면 빈 리스트
+        method1_top7 = []
+    print(f"[15개 후보] 방법1 RRF 상위: {len(method1_top7)}개")
+
+    # 8+7=15 합치고 중복 제거
+    combined_15 = method2_top8 + method1_top7
+    seen_codes_15, unique_15 = set(), []
+    for item in combined_15:
+        c = (item.get("상품코드") or "").strip().upper()
+        if c and c not in seen_codes_15:
+            seen_codes_15.add(c)
+            unique_15.append(item)
+    print(f"[15개 후보] 중복 제거 후: {len(unique_15)}개 (목표 15개)")
+
+    # 🔥 백필: 15개 미달 시 방법2 Top1 카테고리 다음 순위로 채우기
+    method1_next_idx = METHOD1_ITEMS_COUNT  # 7 (다음 세트에서 사용할 시작 인덱스 추적)
+    top1_next_idx = METHOD2_TOP1_COUNT  # 3 (Top1에서 다음 사용할 인덱스)
+    
+    if len(unique_15) < 15 and len(top1_list) > top1_next_idx:
+        backfill_needed = 15 - len(unique_15)
+        print(f"[15개 후보] {backfill_needed}개 부족 → 방법2 Top1 다음 순위로 백필")
+        
+        backfilled_count = 0
+        
+        for item in top1_list[top1_next_idx:]:
+            if backfilled_count >= backfill_needed:
+                break
+            c = (item.get("상품코드") or "").strip().upper()
+            if c and c not in seen_codes_15:
+                seen_codes_15.add(c)
+                unique_15.append(item)
+                backfilled_count += 1
+                top1_next_idx += 1  # 사용한 만큼 인덱스 증가
+        
+        print(f"[15개 후보] 백필 완료: {backfilled_count}개 추가 → 총 {len(unique_15)}개")
+        print(f"[15개 후보] Top1 다음 시작 인덱스: {top1_next_idx}")
+
+
+    # ===== LLM 리랭킹: 15개 → 상위 10개 =====
+    def rerank_15_to_10(products_15, ranking_query: str):
+        if len(products_15) <= 10:
+            return products_15[:10]
+
+
+        # 수정: 제목만 추출해서 LLM에 전달 (인덱스 유지)
+        products_text = "\n".join([
+            f"{i}. {p.get('제목', '제목없음')}"  # ✅ get() 사용으로 안전성 확보
+            for i, p in enumerate(products_15)
+        ])
+        
+        ranking_prompt = f"""사용자 검색: "{ranking_query}"
+
+        상품 목록:
+        {products_text}
+
+        지시사항: 위 {len(products_15)}개 중 최적의 상위 10개 인덱스를 콤마로만 출력하세요.
+        예: 2,0,5,1,8,3,7,4,9,6
+        답변:"""
+        try:
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role":"system","content":"Respond with ONLY 10 numbers (0-based), comma-separated. No other text."},
+                    {"role":"user","content":ranking_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=50
+            )
+            txt = resp.choices[0].message.content.strip()
+            nums = re.findall(r'\d+', txt)
+            idxs = [int(x) for x in nums[:10] if 0 <= int(x) < len(products_15)]
+            picked, used = [], set()
+            for i in idxs:
+                if i not in used:
+                    picked.append(products_15[i]); used.add(i)
+            # 부족하면 앞에서 채우기
+            for i, p in enumerate(products_15):
+                if len(picked) >= 10: break
+                if i not in used:
+                    picked.append(p); used.add(i)
+            return picked[:10]
+        except Exception as e:
+            print(f"[LLM 리랭킹 오류] {e} → 원본 상위 10개 사용")
+            return products_15[:10]
+
+    # 리랭킹 쿼리 선택
+    if preprocessed_query and len(preprocessed_query.strip()) > 2:
+        ranking_query = preprocessed_query
+    elif 'combined_query' in locals() and combined_query and combined_query != query:
+        ranking_query = combined_query
+    else:
+        ranking_query = query
+
+    # 🔥 리랭킹 전 15개 상품 목록 출력
+    print(f"\n{'='*60}")
+    print(f"📋 [세트 1 - 리랭킹 전] 15개 상품 목록:")
+    print(f"{'='*60}")
+    for idx, item in enumerate(unique_15, 1):
+        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
+    print(f"{'='*60}\n")
+
+    final_10 = rerank_15_to_10(unique_15, ranking_query)
+    print(f"[LLM 리랭킹] 15개 → 10개 선택 완료")
+
+    # 🔥 리랭킹 후 10개 상품 목록 출력
+    print(f"\n{'='*60}")
+    print(f"🎯 [세트 1 - 리랭킹 후] 10개 상품 목록:")
+    print(f"{'='*60}")
+    for idx, item in enumerate(final_10, 1):
+        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
+    print(f"{'='*60}\n")
+
+
+    # ===== 세트1: 리랭킹된 10개 사용 =====
+    final_results = []
+    final_results.extend(final_10)
+    print(f"[세트 1] 리랭킹된 10개 사용 (누적 {len(final_results)}개)")
+
+
+    # ===== 세트2: 방법2(4~6등 × 3카테고리) + 방법1(8~14등) = 15개 =====
+    set2_items = []
+    
+    # 방법2: Top1/Top2/Top3에서 두 번째 구간 가져오기
+    # Top1: (1*3)~(2*3) = 3~6 인덱스 → 4~6등
+    set2_top1_start = METHOD2_TOP1_COUNT * 1
+    set2_top1_end = METHOD2_TOP1_COUNT * 2
+    if len(top1_list) >= set2_top1_end:
+        set2_items.extend(top1_list[set2_top1_start:set2_top1_end])
+    
+    # Top2: (1*3)~(2*3) = 3~6 인덱스 → 4~6등
+    set2_top2_start = METHOD2_TOP2_COUNT * 1
+    set2_top2_end = METHOD2_TOP2_COUNT * 2
+    if len(top2_list) >= set2_top2_end:
+        set2_items.extend(top2_list[set2_top2_start:set2_top2_end])
+    
+    # Top3: (1*2)~(2*2) = 2~4 인덱스 → 3~4등
+    set2_top3_start = METHOD2_TOP3_COUNT * 1
+    set2_top3_end = METHOD2_TOP3_COUNT * 2
+    if len(top3_list) >= set2_top3_end:
+        set2_items.extend(top3_list[set2_top3_start:set2_top3_end])
+    
+    # 🔥 방법1: 세트1에서 사용한 다음부터 7개 가져오기
+    set2_m1_start = method1_next_idx  # 세트1이 사용한 다음 인덱스
+    set2_m1_end = set2_m1_start + METHOD1_ITEMS_COUNT
+    if len(method1_all_sets) >= set2_m1_end:
+        set2_items.extend(method1_all_sets[set2_m1_start:set2_m1_end])
+        method1_next_idx = set2_m1_end  # 다음 세트를 위해 업데이트
+    
+    print(f"[세트 2] 방법1 사용 구간: [{set2_m1_start}:{set2_m1_end}] (인덱스)")
+    
+    # 중복 제거
+    seen_codes_set2, unique_set2 = set(), []
+    for item in set2_items:
+        c = (item.get("상품코드") or "").strip().upper()
+        if c and c not in seen_codes_set2:
+            seen_codes_set2.add(c)
+            unique_set2.append(item)
+    
+    print(f"[세트 2] 방법2({METHOD2_ITEMS_PER_SET}개) + 방법1({METHOD1_ITEMS_COUNT}개) = {len(unique_set2)}개 후보 생성")
+    
+    # 🔥 백필: 15개 미달 시 방법2 Top1 카테고리 다음 순위로 채우기
+    if len(unique_set2) < 15 and len(top1_list) > top1_next_idx:
+        backfill_needed = 15 - len(unique_set2)
+        print(f"[세트 2] {backfill_needed}개 부족 → 방법2 Top1 다음 순위로 백필")
+        
+        backfilled_count = 0
+        
+        for item in top1_list[top1_next_idx:]:
+            if backfilled_count >= backfill_needed:
+                break
+            c = (item.get("상품코드") or "").strip().upper()
+            if c and c not in seen_codes_set2:
+                seen_codes_set2.add(c)
+                unique_set2.append(item)
+                backfilled_count += 1
+                top1_next_idx += 1  # 사용한 만큼 인덱스 증가
+        
+        print(f"[세트 2] 백필 완료: {backfilled_count}개 추가 → 총 {len(unique_set2)}개")
+        print(f"[세트 2] Top1 다음 시작 인덱스: {top1_next_idx}")
+    
+    # 🔥 리랭킹 전 15개 상품 목록 출력
+    print(f"\n{'='*60}")
+    print(f"📋 [세트 2 - 리랭킹 전] 15개 상품 목록:")
+    print(f"{'='*60}")
+    for idx, item in enumerate(unique_set2, 1):
+        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
+    print(f"{'='*60}\n")
+    
+    # 세트2 리랭킹 (15개 → 10개)
+    set2_final = rerank_15_to_10(unique_set2, ranking_query)
+    
+    # 🔥 리랭킹 후 10개 상품 목록 출력
+    print(f"\n{'='*60}")
+    print(f"🎯 [세트 2 - 리랭킹 후] 10개 상품 목록:")
+    print(f"{'='*60}")
+    for idx, item in enumerate(set2_final, 1):
+        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
+    print(f"{'='*60}\n")
+    
+    final_results.extend(set2_final)
+    print(f"[세트 2] 리랭킹 후 10개 추가 (누적 {len(final_results)}개)")
+
+
+    # ===== 세트3: 방법2(7~9등 × 3카테고리) + 방법1(15~21등) = 15개 =====
+    set3_items = []
+    
+    # 방법2: Top1/Top2/Top3에서 세 번째 구간 가져오기
+    # Top1: (2*3)~(3*3) = 6~9 인덱스 → 7~9등
+    set3_top1_start = METHOD2_TOP1_COUNT * 2
+    set3_top1_end = METHOD2_TOP1_COUNT * 3
+    if len(top1_list) >= set3_top1_end:
+        set3_items.extend(top1_list[set3_top1_start:set3_top1_end])
+    
+    # Top2: (2*3)~(3*3) = 6~9 인덱스 → 7~9등
+    set3_top2_start = METHOD2_TOP2_COUNT * 2
+    set3_top2_end = METHOD2_TOP2_COUNT * 3
+    if len(top2_list) >= set3_top2_end:
+        set3_items.extend(top2_list[set3_top2_start:set3_top2_end])
+    
+    # Top3: (2*2)~(3*2) = 4~6 인덱스 → 5~6등
+    set3_top3_start = METHOD2_TOP3_COUNT * 2
+    set3_top3_end = METHOD2_TOP3_COUNT * 3
+    if len(top3_list) >= set3_top3_end:
+        set3_items.extend(top3_list[set3_top3_start:set3_top3_end])
+    
+    # 🔥 방법1: 세트2에서 사용한 다음부터 7개 가져오기
+    set3_m1_start = method1_next_idx  # 세트2가 사용한 다음 인덱스
+    set3_m1_end = set3_m1_start + METHOD1_ITEMS_COUNT
+    if len(method1_all_sets) >= set3_m1_end:
+        set3_items.extend(method1_all_sets[set3_m1_start:set3_m1_end])
+        method1_next_idx = set3_m1_end  # 업데이트
+    
+    print(f"[세트 3] 방법1 사용 구간: [{set3_m1_start}:{set3_m1_end}] (인덱스)")
+    
+    # 중복 제거
+    seen_codes_set3, unique_set3 = set(), []
+    for item in set3_items:
+        c = (item.get("상품코드") or "").strip().upper()
+        if c and c not in seen_codes_set3:
+            seen_codes_set3.add(c)
+            unique_set3.append(item)
+    
+    print(f"[세트 3] 방법2({METHOD2_ITEMS_PER_SET}개) + 방법1({METHOD1_ITEMS_COUNT}개) = {len(unique_set3)}개 후보 생성")
+    
+    # 🔥 백필: 15개 미달 시 방법2 Top1 카테고리 다음 순위로 채우기
+    if len(unique_set3) < 15 and len(top1_list) > top1_next_idx:
+        backfill_needed = 15 - len(unique_set3)
+        print(f"[세트 3] {backfill_needed}개 부족 → 방법2 Top1 다음 순위로 백필")
+        
+        backfilled_count = 0
+        
+        for item in top1_list[top1_next_idx:]:
+            if backfilled_count >= backfill_needed:
+                break
+            c = (item.get("상품코드") or "").strip().upper()
+            if c and c not in seen_codes_set3:
+                seen_codes_set3.add(c)
+                unique_set3.append(item)
+                backfilled_count += 1
+                top1_next_idx += 1  # 사용한 만큼 인덱스 증가
+        
+        print(f"[세트 3] 백필 완료: {backfilled_count}개 추가 → 총 {len(unique_set3)}개")
+        print(f"[세트 3] Top1 최종 사용 인덱스: {top1_next_idx}")
+    
+    # 🔥 리랭킹 전 15개 상품 목록 출력
+    print(f"\n{'='*60}")
+    print(f"📋 [세트 3 - 리랭킹 전] 15개 상품 목록:")
+    print(f"{'='*60}")
+    for idx, item in enumerate(unique_set3, 1):
+        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
+    print(f"{'='*60}\n")
+    
+    # 세트3 리랭킹 (15개 → 10개)
+    set3_final = rerank_15_to_10(unique_set3, ranking_query)
+    
+    # 🔥 리랭킹 후 10개 상품 목록 출력
+    print(f"\n{'='*60}")
+    print(f"🎯 [세트 3 - 리랭킹 후] 10개 상품 목록:")
+    print(f"{'='*60}")
+    for idx, item in enumerate(set3_final, 1):
+        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
+    print(f"{'='*60}\n")
+    
+    final_results.extend(set3_final)
+    print(f"[세트 3] 리랭킹 후 10개 추가 (누적 {len(final_results)}개)")
+
+    
+    print(f"\n[최종] 총 {len(final_results)}개 완성")
+
+    # 검색 결과가 없으면 메시지 반환
+    if len(final_results) == 0:
         nores_msg = "No search results. Please specify your search terms more or search for other conditions."
         try:
             session_history.add_ai_message(nores_msg)
@@ -4230,145 +4301,147 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-    def rerank_block_with_llm(block_products, ranking_query: str, block_name: str = ""):
-        """
-        block_products: final_results의 일부 (길이 보통 10개)
-        ranking_query: combined_query / query 그대로 사용
-        """
-        print(f"\n{'='*60}")
-        print(f"🎯 [LLM 리랭킹 블록] {block_name} 상품 수: {len(block_products)}개")
-        print(f"{'='*60}")
-
-        # 상품이 10개 미만이면 그냥 스킵 (원본 유지)
-        if len(block_products) < 10:
-            print(f"[LLM 리랭킹] {block_name} 상품 수 부족({len(block_products)}개) → 리랭킹 스킵")
-            return block_products
-
-        # LLM에 넘길용 텍스트 구성
-        products_for_ranking = [
-            f"{idx}. {item['제목']}"
-            for idx, item in enumerate(block_products)
-        ]
-
-        ranking_prompt = f"""사용자 검색: "{ranking_query}"
-
-        상품 목록:
-        {chr(10).join(products_for_ranking)}
-
-        지시사항: 위 10개 상품을 사용자 검색 의도에 맞게 재정렬하세요.
-        응답은 반드시 다음 형식으로만 답변: 0,1,2,3,4,5,6,7,8,9
-
-        예시: 2,0,5,1,8,3,7,4,9,6
-
-        답변:
-        """
-
-        try:
-            rerank_response = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You must respond with ONLY numbers and commas. No other text allowed."
-                    },
-                    {"role": "user", "content": ranking_prompt}
-                ],
-                temperature=0.1,
-                max_tokens=50
-            )
-
-            rerank_order = rerank_response.choices[0].message.content.strip()
-            print(f"[LLM 리랭킹] {block_name} LLM 응답: '{rerank_order}'")
-
-            # '없음' 계열 응답 방어
-            if "없음" in rerank_order or "해당" in rerank_order or "적절" in rerank_order:
-                print(f"[LLM 리랭킹] {block_name} '없음' 패턴 감지 → 원본 순서 유지")
-                raise ValueError("LLM이 '없음' 응답 반환")
-
-            numbers_only = re.findall(r'\d+', rerank_order)
-            print(f"[LLM 리랭킹] {block_name} 추출된 숫자들: {numbers_only}")
-
-            # 정확히 10개 숫자인지 확인
-            if len(numbers_only) != 10:
-                print(f"[LLM 리랭킹] {block_name} 숫자 개수 오류 ({len(numbers_only)}개) → 원본 순서 유지")
-                raise ValueError(f"숫자 개수가 10개가 아님: {len(numbers_only)}개")
-
-            order_indices = [int(x) for x in numbers_only]
-
-            # 0~9 범위 체크
-            if not all(0 <= x <= 9 for x in order_indices):
-                print(f"[LLM 리랭킹] {block_name} 숫자 범위 오류 → 원본 순서 유지")
-                raise ValueError("숫자가 0-9 범위를 벗어남")
-
-            # 중복 체크
-            if len(set(order_indices)) != 10:
-                print(f"[LLM 리랭킹] {block_name} 중복 숫자 감지 → 원본 순서 유지")
-                raise ValueError("중복된 숫자 존재")
-
-            print(f"[LLM 리랭킹] {block_name} 파싱된 순서: {order_indices}")
-
-            reranked_block = [block_products[i] for i in order_indices]
-            print(f"[LLM 리랭킹] {block_name} 성공적으로 재정렬됨")
-
-            # 디버그 출력
-            print(f"\n{'='*60}")
-            print(f"🎯 [리랭킹 후] {block_name} 재정렬된 상품 제목:")
-            print(f"{'='*60}")
-            for idx, item in enumerate(reranked_block):
-                print(f"{idx}. {item['제목']}")
-            print(f"{'='*60}")
-
-            return reranked_block
-
-        except Exception as e:
-            print(f"[LLM 리랭킹] {block_name} 오류: {e} → 이 블록은 원본 순서 유지")
-            return block_products
-
-
-
+    # ========== 예전 로직 (사용 안 함) ==========
+    # def rerank_block_with_llm(block_products, ranking_query: str, block_name: str = ""):
+    #     """
+    #     block_products: final_results의 일부 (길이 보통 10개)
+    #     ranking_query: combined_query / query 그대로 사용
+    #     """
+    #     print(f"\n{'='*60}")
+    #     print(f"🎯 [LLM 리랭킹 블록] {block_name} 상품 수: {len(block_products)}개")
+    #     print(f"{'='*60}")
+    #
+    #     # 상품이 10개 미만이면 그냥 스킵 (원본 유지)
+    #     if len(block_products) < 10:
+    #         print(f"[LLM 리랭킹] {block_name} 상품 수 부족({len(block_products)}개) → 리랭킹 스킵")
+    #         return block_products
+    #
+    #     # LLM에 넘길용 텍스트 구성
+    #     products_for_ranking = [
+    #         f"{idx}. {item['제목']}"
+    #         for idx, item in enumerate(block_products)
+    #     ]
+    #
+    #     ranking_prompt = f"""사용자 검색: "{ranking_query}"
+    #
+    #     상품 목록:
+    #     {chr(10).join(products_for_ranking)}
+    #
+    #     지시사항: 위 10개 상품을 사용자 검색 의도에 맞게 재정렬하세요.
+    #     응답은 반드시 다음 형식으로만 답변: 0,1,2,3,4,5,6,7,8,9
+    #
+    #     예시: 2,0,5,1,8,3,7,4,9,6
+    #
+    #     답변:
+    #     """
+    #
+    #     try:
+    #         rerank_response = client.chat.completions.create(
+    #             model=LLM_MODEL,
+    #             messages=[
+    #                 {
+    #                     "role": "system",
+    #                     "content": "You must respond with ONLY numbers and commas. No other text allowed."
+    #                 },
+    #                 {"role": "user", "content": ranking_prompt}
+    #             ],
+    #             temperature=0.1,
+    #             max_tokens=50
+    #         )
+    #
+    #         rerank_order = rerank_response.choices[0].message.content.strip()
+    #         print(f"[LLM 리랭킹] {block_name} LLM 응답: '{rerank_order}'")
+    #
+    #         # '없음' 계열 응답 방어
+    #         if "없음" in rerank_order or "해당" in rerank_order or "적절" in rerank_order:
+    #             print(f"[LLM 리랭킹] {block_name} '없음' 패턴 감지 → 원본 순서 유지")
+    #             raise ValueError("LLM이 '없음' 응답 반환")
+    #
+    #         numbers_only = re.findall(r'\d+', rerank_order)
+    #         print(f"[LLM 리랭킹] {block_name} 추출된 숫자들: {numbers_only}")
+    #
+    #         # 정확히 10개 숫자인지 확인
+    #         if len(numbers_only) != 10:
+    #             print(f"[LLM 리랭킹] {block_name} 숫자 개수 오류 ({len(numbers_only)}개) → 원본 순서 유지")
+    #             raise ValueError(f"숫자 개수가 10개가 아님: {len(numbers_only)}개")
+    #
+    #         order_indices = [int(x) for x in numbers_only]
+    #
+    #         # 0~9 범위 체크
+    #         if not all(0 <= x <= 9 for x in order_indices):
+    #             print(f"[LLM 리랭킹] {block_name} 숫자 범위 오류 → 원본 순서 유지")
+    #             raise ValueError("숫자가 0-9 범위를 벗어남")
+    #
+    #         # 중복 체크
+    #         if len(set(order_indices)) != 10:
+    #             print(f"[LLM 리랭킹] {block_name} 중복 숫자 감지 → 원본 순서 유지")
+    #             raise ValueError("중복된 숫자 존재")
+    #
+    #         print(f"[LLM 리랭킹] {block_name} 파싱된 순서: {order_indices}")
+    #
+    #         reranked_block = [block_products[i] for i in order_indices]
+    #         print(f"[LLM 리랭킹] {block_name} 성공적으로 재정렬됨")
+    #
+    #         # 디버그 출력
+    #         print(f"\n{'='*60}")
+    #         print(f"🎯 [리랭킹 후] {block_name} 재정렬된 상품 제목:")
+    #         print(f"{'='*60}")
+    #         for idx, item in enumerate(reranked_block):
+    #             print(f"{idx}. {item['제목']}")
+    #         print(f"{'='*60}")
+    #
+    #         return reranked_block
+    #
+    #     except Exception as e:
+    #         print(f"[LLM 리랭킹] {block_name} 오류: {e} → 이 블록은 원본 순서 유지")
+    #         return block_products
 
 
-    # 🎯 LLM 리랭킹: 상위 30개를 10개씩 3세트로 재정렬
-    # 1) 리랭킹용 쿼리 선택
-    
-    # ✅ 우선순위: preprocessed_query > combined_query > query
-    if preprocessed_query and len(preprocessed_query.strip()) > 2:
-        ranking_query = preprocessed_query  # LLM이 정제한 쿼리 (최우선)
-        query_type = "전처리쿼리"
-    elif len(user_query_parts) > 1 and combined_query != query:
-        ranking_query = combined_query      # 누적된 대화 맥락
-        query_type = "누적쿼리"
-    else:
-        ranking_query = query               # 원본 쿼리 (폴백)
-        query_type = "원본쿼리"
-
-    print(f"[LLM 리랭킹] {query_type} 사용: '{ranking_query}'")
-    print(f"[LLM 리랭킹] 비교 - 원본: '{query}' / 누적: '{combined_query}' / 전처리: '{preprocessed_query}'")
-
-    # 2) 디버깅용: 리랭킹 전 상위 10개만 일단 출력 (원래 하던 것 유지)
-    top_10_products = final_results[:10]
-    print(f"\n{'='*60}")
-    print(f"📋 [리랭킹 전] 상위 10개 상품 제목:")
-    print(f"{'='*60}")
-    for idx, item in enumerate(top_10_products):
-        print(f"{idx}. {item['제목']}")
-    print(f"{'='*60}")
-
-    # 3) 세트 나누기
-    block1 = final_results[0:10]   # 1~10위
-    block2 = final_results[10:20]  # 11~20위
-    block3 = final_results[20:30]  # 21~30위
-
-    # 4) 세트별 리랭킹 (LLM 3번 호출)
-    block1_r = rerank_block_with_llm(block1, ranking_query, "1세트 (1~10위)")
-    block2_r = rerank_block_with_llm(block2, ranking_query, "2세트 (11~20위)")
-    block3_r = rerank_block_with_llm(block3, ranking_query, "3세트 (21~30위)")
 
 
-    # 5) 리랭킹 결과를 final_results에 다시 반영
-    final_results[0:0+len(block1_r)] = block1_r
-    final_results[10:10+len(block2_r)] = block2_r
-    final_results[20:20+len(block3_r)] = block3_r
+
+    # ========== 예전 로직 (사용 안 함) ==========
+    # # 🎯 LLM 리랭킹: 상위 30개를 10개씩 3세트로 재정렬
+    # # 1) 리랭킹용 쿼리 선택
+    # 
+    # # ✅ 우선순위: preprocessed_query > combined_query > query
+    # if preprocessed_query and len(preprocessed_query.strip()) > 2:
+    #     ranking_query = preprocessed_query  # LLM이 정제한 쿼리 (최우선)
+    #     query_type = "전처리쿼리"
+    # elif len(user_query_parts) > 1 and combined_query != query:
+    #     ranking_query = combined_query      # 누적된 대화 맥락
+    #     query_type = "누적쿼리"
+    # else:
+    #     ranking_query = query               # 원본 쿼리 (폴백)
+    #     query_type = "원본쿼리"
+    #
+    # print(f"[LLM 리랭킹] {query_type} 사용: '{ranking_query}'")
+    # print(f"[LLM 리랭킹] 비교 - 원본: '{query}' / 누적: '{combined_query}' / 전처리: '{preprocessed_query}'")
+    #
+    # # 2) 디버깅용: 리랭킹 전 상위 10개만 일단 출력 (원래 하던 것 유지)
+    # top_10_products = final_results[:10]
+    # print(f"\n{'='*60}")
+    # print(f"📋 [리랭킹 전] 상위 10개 상품 제목:")
+    # print(f"{'='*60}")
+    # for idx, item in enumerate(top_10_products):
+    #     print(f"{idx}. {item['제목']}")
+    # print(f"{'='*60}")
+    #
+    # # 3) 세트 나누기
+    # block1 = final_results[0:10]   # 1~10위
+    # block2 = final_results[10:20]  # 11~20위
+    # block3 = final_results[20:30]  # 21~30위
+    #
+    # # 4) 세트별 리랭킹 (LLM 3번 호출)
+    # block1_r = rerank_block_with_llm(block1, ranking_query, "1세트 (1~10위)")
+    # block2_r = rerank_block_with_llm(block2, ranking_query, "2세트 (11~20위)")
+    # block3_r = rerank_block_with_llm(block3, ranking_query, "3세트 (21~30위)")
+    #
+    #
+    # # 5) 리랭킹 결과를 final_results에 다시 반영
+    # final_results[0:0+len(block1_r)] = block1_r
+    # final_results[10:10+len(block2_r)] = block2_r
+    # final_results[20:20+len(block3_r)] = block3_r
 
 
 
