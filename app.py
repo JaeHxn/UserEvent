@@ -727,11 +727,11 @@ class Ranker_DirectSearch:
 
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:
     # 🔧 재질문 임계값 통일 설정
-    THRESHOLD = 0.7             # 평균 점수 임계값 (이상이면 검색 진행)
-    DIRECT_MATCH_HIGH = 0.85      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
+    THRESHOLD = 0.59             # 평균 점수 임계값 (이상이면 검색 진행)
+    DIRECT_MATCH_HIGH = 0.80      # 직접 매칭 높은 신뢰도 (단독 통과 가능)
     FACET_COVERAGE_MIN = 0.50     # 최소 속성 커버리지 (미달 시 재질문)
-    ATTRIBUTE_MIN = 0.55         # 속성 매칭 최소값
-    FACET_SUFFICIENT = 0.55       # 충분한 속성 커버리지
+    ATTRIBUTE_MIN = 0.50         # 속성 매칭 최소값
+    FACET_SUFFICIENT = 0.50       # 충분한 속성 커버리지
     gc.collect()
 
 
@@ -921,7 +921,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 "mail", "post", "postal", "courier", "carrier", "freight",
                 "express", "express delivery", "fast delivery", "quick delivery",
                 "dispatch", "dispatched", "dispatching", "sent", "send", "sending",
-                "consignment", "goods", "cargo", "product delivery"
+                "consignment", "goods", "cargo", "product delivery","Order Inquiry","OrderInquiry"
             ]
         }
         
@@ -991,14 +991,14 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         keywords = [
             # 한국어 인사
             "안녕", "안녕하세요", "안녕하십니까", "반갑습니다", "반가워요",
-            "하이", "헬로", "hi", "hello", "hey", "good morning", "good afternoon",
+            "하이", "헬로","good morning", "good afternoon",
             
             # 챗봇 소개 요청
             "뭐하는", "뭐 하는", "무엇을하는", "무슨기능", "기능이뭐", "뭘도와주는",
             "누구", "누구세요", "누구야", "정체가뭐", "어떤챗봇",
             "what do you do", "what can you do", "who are you", "what are you",
             "introduce yourself", "tell me about yourself", "your function",
-            "help me", "how can you help", "what is your purpose","What can I do?"
+            "how can you help", "what is your purpose","What can I do?"
         ]
         
         for kw in keywords:
@@ -1012,9 +1012,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 return True
         
         return False
-
-
-
 
 
 
@@ -1420,10 +1417,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     lang_map = {
         "ko": "한국어",
         "en": "English",
-        # "zh": "中文",
-        # "ja": "日本語",
-        # "vi": "Tiếng Việt",  # 베트남어
-        # "th": "ไทย",        # 태국어
+        "zh": "中文",
+        "ja": "日本語",
+        "vi": "Tiếng Việt",  # 베트남어
+        "th": "ไทย",        # 태국어
 
 
         # "fr": "Français",
@@ -1656,6 +1653,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             pass
         return "\n".join(lines[-k:])
 
+
+
+    # 점수 가중치 (반드시 합이 1.0이 되도록 설계)
+    W_DIRECT  = 0.65  # 상품이 뚜렷한지
+    W_ATTR    = 0.15  # 필터/속성 얼마나 채워졌는지
+    W_CONTEXT = 0.10  # 대화 맥락 일관성
+    W_BRAND   = 0.10  # 브랜드 명확도
+
+
     def _recompute_route(scores: Dict[str, Any]) -> Tuple[float, str]:
         """
         디테일한 점수 계산 및 라우팅 결정
@@ -1667,7 +1673,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         b = _clamp01(scores.get("brand_match", 0.0))
         
         # 🎯 가중평균 계산 (direct_match 중심)
-        avg = 0.65*d + 0.15*a + 0.10*c + 0.10*b
+        avg = W_DIRECT*d + W_ATTR*a + W_CONTEXT*c + W_BRAND*b
         
         # 🎯 우선: 컨텍스트 + 직접매칭 조합 (특별 케이스)
         if 0.3 <= c <= 0.4 and d >= DIRECT_MATCH_HIGH:
@@ -1686,12 +1692,12 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             print(f"[Route] 직접매칭+속성매칭 높음({d:.3f}≥0.80 + {a:.3f}≥{ATTRIBUTE_MIN}) → 통과")
 
         # 📊 3차: 종합 점수 + 최소 속성 커버리지 (둘 다 더 까다롭게)
-        elif avg >= THRESHOLD and a >= FACET_COVERAGE_MIN:  # 0.85 + 0.60
+        elif avg >= THRESHOLD and a >= FACET_COVERAGE_MIN:  
             route = "proceed" 
             print(f"[Route] 종합점수 높음({avg:.3f}≥{THRESHOLD}) + 속성커버 충족({a:.3f}≥{FACET_COVERAGE_MIN}) → 통과")
             
         # 🎲 4차: 매우 높은 속성 커버리지 + 괜찮은 점수 (조건 강화)
-        elif a >= FACET_SUFFICIENT and avg >= 0.70:  # 0.75 + 0.70
+        elif a >= FACET_SUFFICIENT and avg >= 0.70: 
             route = "proceed"
             print(f"[Route] 속성커버 충분({a:.3f}≥{FACET_SUFFICIENT}) + 기본 점수({avg:.3f}≥0.70) → 완화 통과")
             
@@ -1798,15 +1804,21 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     INTENT_GATE_PROMPT = lambda user_query, recent_context: f"""
     **Professional Product Consultation AI - Specific Product Tailored Questioning**
     Output must be a single JSON object only. No other text or comments.
+    All text values MUST be plain text without any emojis or emoticons (no 😊, 😂 etc.).
 
     The user searched for "{user_query}".
-    [Previous conversation summary] {recent_context or 'none'}
-    Carefully generate follow-up questions so that neither the question nor the choices overlap with what has already been asked in the previous conversation.
+    **CRITICAL: Previous Conversation Analysis (MUST CHECK FIRST!)**
+    [Previous conversation summary] 
+    {recent_context or 'none'}
 
     Read the query and conversation summary, then:
     - Understand what product or category the user is trying to find.
     - Select exactly one axis that will most effectively narrow down the product candidates.
-    - Ask one follow-up question with A,B,C,D choices, strictly focused on that single axis.
+    - Ask one follow-up question with 2–4 choices, labeled in order as:
+      - 2 options: A), B)
+      - 3 options: A), B), C)
+      - 4 options: A), B), C), D)
+    - Decide the number of options (2~4) based on how many **meaningful and distinct** values exist on that axis. Do NOT fabricate options just to reach 4.
     - Never repeat axes or values that are already fixed in the conversation.
 
     --------------------------------------------------
@@ -1823,8 +1835,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     --------------------------------------------------
 
 
-
-    
     1) Detect the main product or category keyword from the query and context.
     - Examples: clothes, coat, dress, shoes, bag, backpack, wallet, AirPods, wireless earphones, laptop, smartphone, ramen, cup noodles, snacks, coffee, bed, chair, desk, light, etc.
     - Treat this as the anchor product/category.
@@ -1838,15 +1848,17 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         - If the user_query implies “AirPods” → the question must include “AirPods”.
         - If the user_query implies “ramen” → the question must include “ramen”.
 
-    3) Choices (A,B,C,D) for the “which-type” axis:
-    - A,B,C,D MUST be concrete, real-world variants or representative types within that product.
+    3) Choices for the “which-type” axis (2~4 options):
+    - Options MUST be concrete, real-world variants or representative types within that product.
     - Examples of the pattern (do not hard-code these; adapt to the product):
         - Clothes: shirt / jacket / coat / dress
         - Earphones: entry model / noise-cancelling model / sports-fit model / premium model
         - Ramen: mild ramen / medium ramen / spicy ramen / extra spicy ramen
     - Each option must be a distinct type/model/variant that a user could realistically pick as a starting point for search.
+    - If there are only 2 or 3 truly meaningful variants, output only 2 or 3 options (do NOT force 4).
 
     The “which-type” axis has top priority whenever the main product/category is clear but the specific variant is not.
+
 
     --------------------------------------------------
     Generic axis library (used after “which-type” is resolved)
@@ -1874,54 +1886,80 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - Structure:
     1) One sentence of background:
         - Explain briefly why this single axis is important to narrow down products now.
-    2) One–two sentences to understand the situation:
+    2) One~two sentences to understand the situation:
         - Reference who/where/how often/how it will be used, but remain aligned with the same axis.
     3) One sentence for an additional consideration:
         - Add one overlooked but relevant factor for this axis (e.g., long-time comfort, storage space, sensitivity to spicy food).
 
-    Then immediately present A)~D) as short choices (1~3 words each) for that single axis.
+    Then immediately present 2–4 options (A)~B) or A)~C) or A)~D)) as short choices (1~3 words each) for that single axis.
 
     --------------------------------------------------
-    Axis selection procedure
-    (only ONE new axis per turn)
+
+    Choice (A,B,C,D) rules (2~4 options)
     --------------------------------------------------
 
-    When selecting the next axis:
+    - Always generate **between 2 and 4 options**:
+        - If there are only 2 meaningful values on that axis → use A), B)
+        - If there are 3 meaningful values → use A), B), C)
+        - If there are 4 meaningful values → use A), B), C), D)
+    - Never invent unnatural or meaningless options just to reach 4.
+    - The count of options must match the number of **realistic** and **distinct** values on that axis (min 2, max 4).
 
-    1) Identify the anchor product/category from user_query and recent_context.
-    2) Collect all locked axes from:
-    - the user’s wording, and
-    - previous clarify_question and answers.
-    3) Remove all locked axes from the candidate list.
-    4) From the remaining axes, choose exactly one axis using these criteria:
-    (a) Information gain: does it sharply reduce the product candidates?
-    (b) Ease of answering: can a non-expert answer quickly without technical terms or numbers?
-    (c) Purchase impact: does it strongly influence which product will be chosen?
-    5) Generate:
-    - one clarify_question following the structure above, and
-    - four options A,B,C,D strictly on that axis.
-
-    Do not mix multiple axes in a single question.
-
-    --------------------------------------------------
-    Choice (A,B,C,D) rules
-    --------------------------------------------------
-
-    - Always generate exactly four options: A, B, C, and D.
-    - Each option must:
-    - Represent a single, clear product attribute, type, or variant along the chosen axis.
+    - Each option MUST:
+    - Represent a single, clear product attribute, type, or variant **along the chosen axis only**.
     - Be 1~3 words long (short phrase-level, not full sentences).
     - Be directly usable as a filter or a product group in a shopping/search system.
+    - Be a pure value on that axis, not a vague description of the whole product.
 
+    - If the chosen axis is **flavor / taste** (for foods, snacks, drinks, etc.):
+    - Good patterns (allowed):
+        - "plain / original", "lightly salted", "spicy", "mild", "barbecue", "cheese", "onion", "wasabi", "sour cream", "lemon", "chocolate".
+    - Bad patterns (forbidden as option labels):
+        - Vague or marketing-style phrases such as:
+        - "classic chips", "classic taste", "premium chips", "special chips", "best flavor", "signature taste".
+    - If the intended meaning is "basic salted/original flavor", normalize the label to:
+        - "plain/original" or "lightly salted".
+        - You MUST NOT use "classic" as a flavor or type label.
+
+    - If the chosen axis is **form / type / style**:
+    - Examples of GOOD options:
+        - Bags: "backpack", "tote bag", "crossbody", "shoulder bag"
+        - Shoes: "sneakers", "loafers", "sandals", "boots"
+        - Lighting: "ceiling light", "desk lamp", "floor lamp", "wall lamp"
+    - Do NOT mix marketing adjectives into the option labels:
+        - Forbidden: "premium sneakers", "classic bag", "best desk lamp" as option texts.
+
+    - If the chosen axis is **size / volume / capacity**:
+    - Use clean size values only:
+        - "small", "medium", "large", "XL", "single pack", "multi pack", "500 ml", "1 L"
+    - Do NOT mix unrelated info in one option:
+        - Forbidden: "large cheap set" (mixes size + price)
+        - Keep each option focused on size/volume only.
+
+    - Generic rules for ALL products and axes:
     - Do NOT:
-    - Use pure situations such as “commuting”, “home use”, “office” as options themselves.
+        - Use pure situations such as "commuting", "home use", "office" as options themselves.
         (These may appear in the question text, but not as option labels.)
-    - Mix unrelated axes inside one option (e.g., “cheap AND premium brand AND waterproof”).
-    - Include “Other”, “Etc”, “Type it yourself”, or any equivalent wording as A, B, C, or D.
+        - Mix unrelated axes inside one option
+        (e.g., "cheap AND premium brand AND waterproof" combines price + brand + function).
+        - Include "Other", "Etc", "Type it yourself", or any equivalent wording as A, B, C, or D.
+        - Use vague marketing or emotional words as option labels, such as:
+        - "classic", "premium", "special", "best", "signature",
+            "high quality", "deluxe", "basic type", "standard type",
+            "trendy", "stylish", "hot item", "popular".
+    - Prefer:
+        - Axis-pure values such as:
+        - flavor: "spicy", "barbecue", "cheese"
+        - size: "small", "large"
+        - fit: "slim fit", "regular fit", "oversized"
+        - material: "cotton", "leather", "stainless steel"
+        - Option texts that can be used as-is as catalog filter tags.
 
-    - If allowing free-text input is useful, keep A,B,C,D as concrete options and optionally add a separate sentence after the list, such as:
-    - “If none of these match, you can answer in your own words.”
+    - If allowing free-text input is useful, keep the 2~4 options as concrete values and optionally add a separate sentence after the list, such as:
+    - "If none of these match, you can answer in your own words."
     This must not be treated as an extra option.
+
+
 
     --------------------------------------------------
     Route rules
@@ -1985,8 +2023,16 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     - Only when route="proceed" may clarify_question be set to the empty string ("").
     
 
+    - All string fields in the JSON (clarify_question, expanded_terms, notes, etc.)
+        MUST NOT contain any emojis or emoticons.
+        Use only plain text words. (No emojis like 😊, 😂, ❤️ and no emoticons.)
+
+
     Language rules
     - Detect the user’s language → then output **only in {target_lang}**. Do not generate text in any other language. No mixing of languages.
+    - Do not use emojis or emoticons in any field. Plain text only.
+
+
 
     JSON schema:
     {{
@@ -1996,12 +2042,11 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     "brand_match": 0.0,
     "avg_score": 0.0,
     "route": "clarify",
-    "clarify_question": "Natural follow-up question like a sales expert + A,B,C,D choices",
+    "clarify_question": "Natural follow-up question like a sales expert + 2~4 choices (A,B[,C[,D]])",
     "expanded_terms": ["3~6 Korean keywords useful for search"],
     "notes": ["Rationale for your judgment"]
     }}
     """
-
 
 
     
@@ -2078,13 +2123,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     "안녕하세요! 👋\n\n"
                     "저는 상품 검색을 도와드리는 AI 챗봇입니다. 🤖\n"
                     "찾으시는 상품을 말씀해 주시면 최적의 결과를 추천해 드리겠습니다!\n\n"
-                    "예: '여름용 가방', '겨울 따뜻한 장갑', '운동화 추천해줘' 등"
+                    "예: '여름용 가방', '겨울 따뜻한 장갑', '운동화 추천해줘' 등\n\n"
+                    "채팅으로 지원하는 1.홈페이지URL 2.주문조회 3.인사/소개 등을 입력해 보세요."
                 ),
                 "English": (
                     "Hello! 👋\n\n"
                     "I'm an AI chatbot that helps you search for products. 🤖\n"
                     "Tell me what you're looking for, and I'll recommend the best results!\n\n"
-                    "Examples: 'summer bag', 'warm winter gloves', 'recommend sneakers'"
+                    "Examples: 'summer bag', 'warm winter gloves', 'recommend sneakers'\n\n"
+                    "You can also chat with me using 1. Homepage URL 2. Order Inquiry 3. Greeting/Introduction."
                 )
             }
             
@@ -2121,27 +2168,38 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             model=model,
             messages=[
                 {"role": "system", "content": """JSON ONLY. No prose. CRITICAL: if route='clarify', clarify_question MUST NOT be empty string.
+
                 
                                 IMPORTANT LINE FORMATTING:
-                                - In clarify_question, put each choice A), B), C), D) on separate lines
-                                - Use actual line breaks in the JSON string value
-                                - Add ONE EXTRA line break between question and choices for better readability
-                                - Format example:
-                                "clarify_question": "It's a question."
-                
-                                A) Select 1
-                                B) Select 2
-                                C) Select 3
-                                D) Select 4"
-                
-                                DO NOT write choices in one line like "A) Select1 B) Select2 C) Select3 D) Select4"
+                                - In clarify_question, put each choice A), B), (C), (D) on separate lines.
+                                - If there are only 2 options, output only A) and B).
+                                - If there are 3 options, output only A), B), C).
+                                - Use actual line breaks in the JSON string value.
+                                - Add ONE EXTRA line break between question and choices for better readability.
+
+                                Format examples:
+
+                                "clarify_question": "It's a question about a binary choice.
+
+                                A) Option 1
+                                B) Option 2"
+
+                                or
+
+                                "clarify_question": "It's a question with three choices.
+
+                                A) Option 1
+                                B) Option 2
+                                C) Option 3"
+
+                                DO NOT write choices in one line like "A) Select1 B) Select2 C) Select3 D) Select4".
                                 PUT EACH CHOICE ON NEW LINE with real line breaks inside JSON string.
-                                ALWAYS add empty line between question text and first choice A)."""},
+                                ALWAYS add an empty line between question text and the first choice A)."""},
                 {"role": "user", "content": INTENT_GATE_PROMPT(user_query, recent_context)}
             ],
             temperature=0,
             response_format={"type": "json_object"},
-            max_tokens=600
+            max_tokens=1000
         ).choices[0].message.content
 
 
@@ -2167,12 +2225,31 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # 안내 문구를 언어에 따라 다르게 설정
         notice_ko = "※ 선택지에 없는 경우 자유롭게 글로 서술해서 입력하셔도 됩니다."
         notice_en = "※ If none of the choices fit, feel free to write your answer in your own words."
+        notice_zh = "※ 如果选项中没有合适的内容，可以自由用文字描述后输入。"
+        notice_ja = "※ 選択肢にない場合は、自由に文章で入力していただいて構いません。"
+        notice_vi = "※ Nếu không có lựa chọn nào phù hợp, bạn có thể tự do nhập câu trả lời bằng lời văn của mình."
+        notice_th = "※ หากไม่มีตัวเลือกใดที่ตรงกับคุณ คุณสามารถพิมพ์คำตอบเป็นข้อความได้อย่างอิสระ"
+        notice_ru = "※ Если ни один из вариантов не подходит, вы можете свободно ввести ответ в произвольной форме."
 
-        # target_lang은 이미 위에서 결정됨
+        # target_lang은 이미 위에서 결정됨 target_lang 예시: "한국어", "English", "中文", "日本語", "Tiếng Việt", "ไทย", "Русский" 등 
         if target_lang == "한국어":
             notice = notice_ko
-        else:
+        elif target_lang in ("English", "영어"):
             notice = notice_en
+        elif target_lang in ("中文", "중국어"):
+            notice = notice_zh
+        elif target_lang in ("日本語", "일본어"):
+            notice = notice_ja
+        elif target_lang in ("Tiếng Việt", "베트남어"):
+            notice = notice_vi
+        elif target_lang in ("ไทย", "태국어"):
+            notice = notice_th
+        elif target_lang in ("Русский", "러시아어"):
+            notice = notice_ru
+        else:
+            # 혹시 매핑 안 된 언어면 기본 영어로 폴백
+            notice = notice_en
+
 
         if intent_eval.get("clarify_question"):
             intent_eval["clarify_question"] = intent_eval["clarify_question"].strip()
@@ -2200,7 +2277,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             "_raw_llm": raw,  # 👈 원문 JSON 그대로 보관
         })
 
-        # print(f"[완성률] avg_score={avg_score:.3f} → {completion_message}")
 
         # 5) 디버그(원하면 남기되, recent_context엔 안 넣도록 태그 유지)
         session_history.add_ai_message(f"[INTENT_GATE]{json.dumps(intent_eval, ensure_ascii=False)}")
@@ -2359,7 +2435,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 """이전 대화에서 의미있는 원본 질문들을 추출"""
                 context_parts = []
                 
-                # 최근 5개 메시지에서 사용자 질문들 수집
+                # 최근 10개 메시지에서 사용자 질문들 수집
                 recent_messages = history.messages[-10:]  # 최근 10개 메시지 확인
                 
                 for msg in recent_messages:
@@ -2369,7 +2445,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                         # 필터링 조건
                         if ("[clarify]" in content or  # clarify 태그 제외
                             _parse_abcd_answer(content.strip()) or  # A/B/C/D 답변 제외
-                            len(content.strip()) < 3 or  # 너무 짧은 답변 제외
                             content.strip().lower() in ['네', '아니오', 'yes', 'no']):  # 단순 답변 제외
                             continue
                         
@@ -2404,6 +2479,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             query = combined_query
             session_history.add_user_message(f"[clarify]{resolved}")
             skip_add_user_message = True
+            skip_intent_gate = True             # ✅ 이번 턴에는 Intent Gate를 다시 돌리지 않겠다
+            resolved_choice_text = resolved     # ✅ 나중에 expanded_terms 등에 쓸 수 있게 저장
 
 
 
@@ -2508,31 +2585,31 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     clarification_count = 0
     user_query_parts = []
 
-    def _is_short_answer(text: str) -> bool:
-        """A/B/숫자/네/아무거나 같은 단답형 필터"""
-        t = (text or "").strip()
-        if not t:
-            return False
+    # def _is_short_answer(text: str) -> bool:
+    #     """A/B/숫자/네/아무거나 같은 단답형 필터"""
+    #     t = (text or "").strip()
+    #     if not t:
+    #         return False
 
-        short_tokens = {
-            "a", "b", "c", "d",
-            "A", "B", "C", "D",
-            "네", "예", "아니오", "아니요",
-            "응", "웅", "ㅇㅇ", "ㅇㅋ", "ㅇㅋㅇㅋ",
-            "상관없어요", "상관 없어", "아무거나", "다 좋아",
-        }
-        if t in short_tokens:
-            return True
+    #     short_tokens = {
+    #         "a", "b", "c", "d",
+    #         "A", "B", "C", "D",
+    #         "네", "예", "아니오", "아니요",
+    #         "응", "웅", "ㅇㅇ", "ㅇㅋ", "ㅇㅋㅇㅋ",
+    #         "상관없어요", "상관 없어", "아무거나", "다 좋아",
+    #     }
+    #     if t in short_tokens:
+    #         return True
 
-        # 숫자 하나/두 개 같은 선택지
-        if len(t) <= 2 and t.isdigit():
-            return True
+    #     # 숫자 하나/두 개 같은 선택지
+    #     if len(t) <= 2 and t.isdigit():
+    #         return True
 
-        # 너무 짧은 건 검색어로 안 씀
-        if len(t) < 4:
-            return True
+    #     # 너무 짧은 건 검색어로 안 씀
+    #     if len(t) < 4:
+    #         return True
 
-        return False
+    #     return False
 
     def sanitize_user_fragment(text: str) -> str:
         t = (text or "").strip()
@@ -2593,9 +2670,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 if not clean_content:
                     continue
 
-                if _is_short_answer(clean_content):
-                    print(f"[단답형 제외] '{clean_content}'")
-                    continue
+                # if _is_short_answer(clean_content):
+                #     print(f"[단답형 제외] '{clean_content}'")
+                #     continue
 
                 if len(clean_content) < 50:
                     user_query_parts.append(clean_content)
@@ -2644,16 +2721,14 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         except Exception:
             clarify_answer = None
 
-        # ★ route 우선 적용 (direct_match≥0.8 포함)
+        # ★ route 우선 적용 (수정)
         if route == "proceed":
             pass  # 다음 단계 진행
-        elif clarification_count >= 4:  # 재질문 횟수 4번 초과 시 강제 진행 총합계임.
-            # 🚨 재질문 횟수 제한
+        elif clarification_count >= 4:  # 재질문 횟수 4번 초과 시 강제 진행
             print(f"[재질문 제한] {clarification_count}번 재질문 완료 → 누적쿼리로 강제 진행: '{combined_query}'")
-            query = combined_query  # 누적된 쿼리로 검색 진행
-            # 강제로 검색 진행 (재질문 건너뛰기)
-        elif avg_score < THRESHOLD and not clarify_answer:
-            # 평균 점수 미달 + 보강답변 없음 → 재질문
+            query = combined_query
+        # 🔥 수정: route가 clarify면 무조건 재질문 (avg_score 조건 제거)
+        elif route == "clarify" and not clarify_answer:
             # 🧠 누적 쿼리로 재평가 (쿼리가 실제로 달라졌을 때만)
             if combined_query != query and len(user_query_parts) > 1:
                 print(f"[누적 재평가] 기존 쿼리='{query}' → 누적 쿼리='{combined_query}'")
@@ -2662,8 +2737,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 avg_score_combined = float(intent_eval_combined.get("avg_score", 0.0))
                 route_combined = (intent_eval_combined.get("route") or "").lower()
                 
-                if route_combined == "proceed" or avg_score_combined >= THRESHOLD:
-                    print(f"[누적 재평가] 통과! avg={avg_score_combined:.3f} → 검색 진행")
+                if route_combined == "proceed":
+                    print(f"[누적 재평가] clarify→proceed 전환 → 검색 진행")
                     query = combined_query
                     # 재질문 건너뛰고 검색으로 진행
                 else:
@@ -2673,10 +2748,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     
                     # 재질문 생성
                     followup = intent_eval.get("clarify_question") or "조금만 더 구체화해주실래요?"
-                    enhanced = followup  # 완성률 메시지 없이 질문만
+                    enhanced = followup
 
                     return {
-                        "query": combined_query,  # 누적 쿼리로 저장
+                        "query": combined_query,
                         "assistant_message": enhanced,      
                         "UserMessage": enhanced,            
                         "RawContext": [m.content for m in session_history.messages],
@@ -3214,7 +3289,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
  
 
-    # ================== 벡터검색후 100개 리스트에서 Nano 카테고리 Top3추출 부분 ==================
+    # ================== 벡터검색후 100개 리스트에서 Nano 카테고리 Top3추출 부분 이였는데==================
+    # ================== LLM에서 Top1~3 추출후 각각 벡터검색후 30개씩 추출후 합계 90개 리스트에서 Nano 카테고리 Top3 추출 부분 ==================
 
     cat_match_results = []
     
@@ -3369,8 +3445,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     # 검색 조건 구성
     search_conditions = []
-
-    fuzz_number = 85
+    fuzz_number = 80  # 제목 중복제거용 유사도 기준값
 
 
     # 가격/크기 조건 처리
@@ -3453,8 +3528,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         for idx, hit in enumerate(hits):
             item = _build_info_from_hit(hit)
             item["vector_match_score"] = 1000 - idx
-
-
             title = item.get("제목", "")
             # difflib → RapidFuzz로 변경
             if any(fuzz.ratio(title, v.get("제목", "")) >= fuzz_number for v in vector_items):
@@ -3534,7 +3607,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # 저장 + 최종 평균 (벡터 + 직접매칭만)
         it["rrf_vec"]   = rrf_vec
         it["rrf_title"] = rrf_title
-        it["rrf_all"]   = (rrf_vec + rrf_title) / 2.0
+        it["rrf_all"]   = (rrf_vec + rrf_title*1.5) / 2.5
 
         # (로그용) 1000점 환산도 함께 저장
         it["vecScore1000"]   = _rrf_to_1000(rrf_vec, BASE_K)
@@ -3649,7 +3722,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             vector_hits = collection.search(
                 data=[q_vec],
                 anns_field="emb",
-                param={"metric_type":"L2","params":{"nprobe":64}},
+                param={"metric_type":"L2","params":{"nprobe":128}},
                 limit=size,
                 expr=final_expr,
                 output_fields=[
@@ -3700,7 +3773,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 
                 it["rrf_vec"] = rrf_vec
                 it["rrf_title"] = rrf_title
-                it["rrf_all"] = (rrf_vec + rrf_title) / 2.0
+                it["rrf_all"] = (rrf_vec + rrf_title*1.5) / 2.5
                 it["검색방식"] = f"카테고리검색_{category}"
 
             # 정렬 및 중복 제거
@@ -3824,11 +3897,25 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         if method2_all_sets and set_num < len(method2_all_sets):
             for item in method2_all_sets[set_num][:5]:
                 code = norm(item.get('상품코드'))
+                title = item.get("제목", "").strip()
+                
+                # ✅ 상품코드 + 제목 둘 다 체크
                 if code and code not in used_codes:
-                    set_items.append(item)
-                    used_codes.add(code)
-                    method2_added += 1
-                    total_m2 += 1
+                    # 제목 중복 체크 (기존 set_items와 비교)
+                    is_title_duplicate = False
+                    if title:
+                        for existing_item in set_items:
+                            existing_title = existing_item.get("제목", "").strip()
+                            if existing_title and fuzz.ratio(title, existing_title) >= fuzz_number:
+                                is_title_duplicate = True
+                                print(f"[세트 {set_num + 1}] 방법2 제목 중복 제거: '{title[:30]}...'")
+                                break
+                    
+                    if not is_title_duplicate:
+                        set_items.append(item)
+                        used_codes.add(code)
+                        method2_added += 1
+                        total_m2 += 1
         print(f"[세트 {set_num + 1}] 방법2 결과 {method2_added}개 추가")
 
         # 2) 방법1로 세트 10개 될 때까지 보충
@@ -3838,11 +3925,25 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 if len(set_items) >= 10:
                     break
                 code = norm(product.get('상품코드'))
+                title = product.get("제목", "").strip()
+                
+                # ✅ 상품코드 + 제목 둘 다 체크
                 if code and code not in used_codes:
-                    set_items.append(product)
-                    used_codes.add(code)
-                    method1_added += 1
-                    total_m1 += 1
+                    # 제목 중복 체크 (기존 set_items와 비교)
+                    is_title_duplicate = False
+                    if title:
+                        for existing_item in set_items:
+                            existing_title = existing_item.get("제목", "").strip()
+                            if existing_title and fuzz.ratio(title, existing_title) >= fuzz_number:
+                                is_title_duplicate = True
+                                print(f"[세트 {set_num + 1}] 방법1 제목 중복 제거: '{title[:30]}...'")
+                                break
+                    
+                    if not is_title_duplicate:
+                        set_items.append(product)
+                        used_codes.add(code)
+                        method1_added += 1
+                        total_m1 += 1
         print(f"[세트 {set_num + 1}] 방법1 결과 {method1_added}개 추가 (중복 제거 후)")
 
         final_results.extend(set_items)
@@ -3906,17 +4007,29 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         print(f"\n[세트 {set_num + 1}] 백필 시작")
         set_items = []
     
-        # 1) 기본 방법2 (최대 5개)
+        # 1) 기본 방법2 (최대 5개)   
         method2_added = 0
         if method2_all_sets and set_num < len(method2_all_sets):
             for item in method2_all_sets[set_num][:5]:
                 code = norm(item.get('상품코드'))
+                title = (item.get("제목","") or "").strip()
                 if code and code not in used_codes:
+                    # 제목 유사도 중복 체크 (set_items 기준)
+                    is_title_dup = False
+                    if title:
+                        for ex in set_items:
+                            ex_title = (ex.get("제목","") or "").strip()
+                            if ex_title and fuzz.ratio(title, ex_title) >= fuzz_number:   #중복제거 추가.11.25
+                                is_title_dup = True
+                                print(f"[세트 {set_num+1}] 방법2 제목 중복 제거: '{title[:30]}'")
+                                break
+                    if is_title_dup:
+                        continue
                     set_items.append(item)
                     used_codes.add(code)
                     method2_added += 1
                     total_m2 += 1
-    
+
         # 2) 기본 방법1 (최대 5개)
         method1_added = 0
         if method1_all_sets and set_num < len(method1_all_sets):
@@ -3924,7 +4037,18 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 if len(set_items) >= 10:
                     break
                 code = norm(product.get('상품코드'))
+                title = (product.get("제목","") or "").strip()
                 if code and code not in used_codes:
+                    is_title_dup = False
+                    if title:
+                        for ex in set_items:
+                            ex_title = (ex.get("제목","") or "").strip()
+                            if ex_title and fuzz.ratio(title, ex_title) >= fuzz_number:   #중복제거 추가.11.25
+                                is_title_dup = True
+                                print(f"[세트 {set_num+1}] 방법1 제목 중복 제거: '{title[:30]}'")
+                                break
+                    if is_title_dup:
+                        continue
                     set_items.append(product)
                     used_codes.add(code)
                     method1_added += 1
@@ -4106,135 +4230,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-
-
-    # # 🎯 LLM 리랭킹: 상위 10개 상품을 사용자 쿼리에 맞게 재정렬
-    # top_10_products = final_results[:10]
-    
-    # # 리랭킹용 프롬프트 생성
-    # products_for_ranking = []
-    # for idx, item in enumerate(top_10_products):
-    #     products_for_ranking.append(f"{idx}. {item['제목']}")
-    
-    # # 🎯 리랭킹용 쿼리 선택: 누적쿼리 우선 사용
-    # if len(user_query_parts) > 1 and combined_query != query:
-    #     ranking_query = combined_query  # 누적된 대화 맥락 활용
-    #     query_type = "누적쿼리"
-    # else:
-    #     ranking_query = query  # 단일 질문인 경우 원본 쿼리
-    #     query_type = "원본쿼리"
-    
-    # print(f"[LLM 리랭킹] {query_type} 사용: '{ranking_query}'")
-    
-    # # 🔍 리랭킹 전 상품 제목들 출력
-    # print(f"\n{'='*60}")
-    # print(f"📋 [리랭킹 전] 상위 10개 상품 제목:")
-    # print(f"{'='*60}")
-    # for idx, item in enumerate(top_10_products):
-    #     print(f"{idx}. {item['제목']}")
-    # print(f"{'='*60}")
-    
-    # # 🛡️ 안전장치: 상품이 10개 미만인 경우 처리   
-    # if len(top_10_products) < 10:
-    #     print(f"[LLM 리랭킹] 상품 수 부족 ({len(top_10_products)}개) → 리랭킹 스킵")
-    #     # 리랭킹 없이 원본 순서 유지
-    #     print(f"\n{'='*60}")
-    #     print(f"⚠️ [리랭킹 스킵] 상품 수 부족으로 원본 순서 유지:")
-    #     print(f"{'='*60}")
-    #     for idx, item in enumerate(top_10_products):
-    #         print(f"{idx}. {item['제목']}")
-    #     print(f"{'='*60}")
-    # else:
-    #     ranking_prompt = f"""사용자 검색: "{ranking_query}"
-
-    #                         상품 목록:
-    #                         {chr(10).join(products_for_ranking)}
-
-    #                         지시사항: 위 10개 상품을 사용자 검색 의도에 맞게 재정렬하세요.
-    #                         응답은 반드시 다음 형식으로만 답변: 0,1,2,3,4,5,6,7,8,9
-
-    #                         예시: 2,0,5,1,8,3,7,4,9,6
-
-    #                         답변:
-    #                     """
-
-    # try:
-    #     # LLM으로 리랭킹 순서 받기
-    #     rerank_response = client.chat.completions.create(
-    #         model=LLM_MODEL,
-    #         messages=[
-    #             {"role": "system", "content": "You must respond with ONLY numbers and commas. No other text allowed."},
-    #             {"role": "user", "content": ranking_prompt}
-    #         ],
-    #         temperature=0.1,
-    #         max_tokens=50
-    #     )
-        
-    #     rerank_order = rerank_response.choices[0].message.content.strip()
-    #     print(f"[LLM 리랭킹] LLM 응답: '{rerank_order}'")
-        
-    #     # 🛡️ 강화된 파싱 로직
-    #     # 1. "없음" 패턴 감지
-    #     if "없음" in rerank_order or "해당" in rerank_order or "적절" in rerank_order:
-    #         print(f"[LLM 리랭킹] '없음' 패턴 감지 → 원본 순서 유지")
-    #         raise ValueError("LLM이 '없음' 응답 반환")
-        
-    #     # 2. 숫자와 쉼표만 추출
-    #     numbers_only = re.findall(r'\d+', rerank_order)
-    #     print(f"[LLM 리랭킹] 추출된 숫자들: {numbers_only}")
-        
-    #     # 3. 정확히 10개 숫자인지 확인
-    #     if len(numbers_only) != 10:
-    #         print(f"[LLM 리랭킹] 숫자 개수 오류 ({len(numbers_only)}개) → 원본 순서 유지")
-    #         raise ValueError(f"숫자 개수가 10개가 아님: {len(numbers_only)}개")
-        
-    #     # 4. 숫자 범위 검증 (0-9)
-    #     order_indices = [int(x) for x in numbers_only]
-    #     if not all(0 <= x <= 9 for x in order_indices):
-    #         print(f"[LLM 리랭킹] 숫자 범위 오류 → 원본 순서 유지")
-    #         raise ValueError("숫자가 0-9 범위를 벗어남")
-        
-    #     # 5. 중복 숫자 검증
-    #     if len(set(order_indices)) != 10:
-    #         print(f"[LLM 리랭킹] 중복 숫자 감지 → 원본 순서 유지")
-    #         raise ValueError("중복된 숫자 존재")
-            
-    #     print(f"[LLM 리랭킹] 파싱된 순서: {order_indices}")
-        
-    #     # 리랭킹 적용
-    #     reranked_products = [top_10_products[i] for i in order_indices]
-    #     final_results[:10] = reranked_products  # 상위 10개만 교체
-    #     print(f"[LLM 리랭킹] 성공적으로 재정렬됨")
-        
-    #     # 🔍 리랭킹 후 상품 제목들 출력
-    #     print(f"\n{'='*60}")
-    #     print(f"🎯 [리랭킹 후] 재정렬된 상위 10개 상품 제목:")
-    #     print(f"{'='*60}")
-    #     for idx, item in enumerate(reranked_products):
-    #         print(f"{idx}. {item['제목']}")
-    #     print(f"{'='*60}")
-                
-    # except (ValueError, IndexError) as e:
-    #     print(f"[LLM 리랭킹] 파싱 오류: {e} → 원본 순서 유지")
-    #     print(f"🔍 원본 순서 그대로 사용")
-        
-    # except Exception as e:
-    #     print(f"[LLM 리랭킹] 일반 오류: {e} → 원본 순서 유지")
-    #     print(f"\n{'='*60}")
-    #     print(f"⚠️ [리랭킹 실패] 원본 순서 그대로 사용:")
-    #     print(f"{'='*60}")
-    #     for idx, item in enumerate(top_10_products):
-    #         print(f"{idx}. {item['제목']}")
-    #     print(f"{'='*60}")
-    
-    # print("\n🎯 최종 리랭킹된 상위 10개 상품:")
-    # for idx, item in enumerate(final_results[:10], 1):
-    #     print(f"\n{idx}. {item['제목']}")
-    #     print(f"   카테고리: {item['카테고리']}")
-    #     print(f"   가격: {item['가격']:,}원")
-
-
-
     def rerank_block_with_llm(block_products, ranking_query: str, block_name: str = ""):
         """
         block_products: final_results의 일부 (길이 보통 10개)
@@ -4375,12 +4370,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     final_results[10:10+len(block2_r)] = block2_r
     final_results[20:20+len(block3_r)] = block3_r
 
-    # # 6) 최종 상위 10개 출력 (기존 출력 로직 재사용) - TEST 출력용 실사용시 프린트 문 주석 or 제거 처리 필요
-    # print("\n🎯 최종 리랭킹된 상위 30개 상품:")
-    # for idx, item in enumerate(final_results[:30], 1):
-    #     print(f"\n{idx}. {item['제목']}")
-    #     print(f"   카테고리: {item['카테고리']}")
-    #     print(f"   가격: {item['가격']:,}원")
+
 
 
 
