@@ -57,6 +57,11 @@ import gc
 import sys
 from rank_categories import get_top_categories
 
+import asyncio
+import functools
+import logging
+import uuid
+
 
 executor = ThreadPoolExecutor()
 
@@ -203,6 +208,14 @@ MESSAGES = {
     "hard_ban_still": "Protection mode is active. Please try again in {remain} second(s).",
     "rate_limit_hit": "Rate limit reached. Please try again shortly."
 }
+
+
+async def run_sync_llm(func, *args, **kwargs):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, 
+        functools.partial(func, *args, **kwargs)
+    )
 
 def _client_ip(req: Request) -> str:
     # 프록시 없는 구조: X-Forwarded-For 신뢰 금지
@@ -3445,7 +3458,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     # 검색 조건 구성
     search_conditions = []
-    fuzz_number = 80  # 제목 중복제거용 유사도 기준값
+    fuzz_number = 65  # 제목 중복제거용 유사도 기준값
 
 
     # 가격/크기 조건 처리
@@ -3607,7 +3620,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # 저장 + 최종 평균 (벡터 + 직접매칭만)
         it["rrf_vec"]   = rrf_vec
         it["rrf_title"] = rrf_title
-        it["rrf_all"]   = (rrf_vec + rrf_title*1.5) / 2.5
+        it["rrf_all"]   = (rrf_vec + rrf_title) / 2
 
         # (로그용) 1000점 환산도 함께 저장
         it["vecScore1000"]   = _rrf_to_1000(rrf_vec, BASE_K)
@@ -3760,7 +3773,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 
                 it["rrf_vec"] = rrf_vec
                 it["rrf_title"] = rrf_title
-                it["rrf_all"] = (rrf_vec + rrf_title*1.5) / 2.5
+                it["rrf_all"] = (rrf_vec*3 + rrf_title) / 4
                 it["검색방식"] = f"카테고리검색_{category}"
 
             # 정렬 및 중복 제거
@@ -3821,15 +3834,14 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
     # ===== 방법2 구성 설정 =====
-    METHOD2_TOP1_COUNT = 3  # Top1 카테고리에서 가져올 개수 (기존 2개 → 3개)
-    METHOD2_TOP2_COUNT = 3  # Top2 카테고리에서 가져올 개수 (기존 2개 → 3개)  
-    METHOD2_TOP3_COUNT = 2  # Top3 카테고리에서 가져올 개수 (기존 1개 → 2개)
-    METHOD2_ITEMS_PER_SET = METHOD2_TOP1_COUNT + METHOD2_TOP2_COUNT + METHOD2_TOP3_COUNT  # 세트당 총 개수 (8개)
+    METHOD2_TOP1_COUNT = 4  # Top1 카테고리에서 가져올 개수 (3 → 4개)
+    METHOD2_TOP2_COUNT = 4  # Top2 카테고리에서 가져올 개수 (3 → 4개)  
+    METHOD2_TOP3_COUNT = 3  # Top3 카테고리에서 가져올 개수 (2 → 3개)
+    METHOD2_ITEMS_PER_SET = METHOD2_TOP1_COUNT + METHOD2_TOP2_COUNT + METHOD2_TOP3_COUNT  # 세트당 총 11개
     METHOD2_TOTAL_FETCH = 40  # 각 카테고리에서 미리 가져올 총 개수
 
     print(f"[방법2 설정] Top1:{METHOD2_TOP1_COUNT}개 + Top2:{METHOD2_TOP2_COUNT}개 + Top3:{METHOD2_TOP3_COUNT}개 = 총 {METHOD2_ITEMS_PER_SET}개/세트")
 
-    # ... existing code (search_by_category_method2 함수는 그대로 유지) ...
 
     # 방법2 결과를 세트로 구성 (3:3:2 비율)
     method2_all_sets = []
@@ -3906,36 +3918,47 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
     # ===== 15개 후보 생성: 방법2(8) + 방법1(7) =====
-    METHOD1_ITEMS_COUNT = 7  # 방법1에서 가져올 개수 (요구사항)
+    METHOD1_ITEMS_COUNT = 4  # 방법1에서 가져올 개수 (7 → 4개)
 
-    # 방법2 첫 세트 8개
-    method2_top8 = method2_all_sets[0] if method2_all_sets else []
-    if len(method2_top8) > METHOD2_ITEMS_PER_SET:
-        method2_top8 = method2_top8[:METHOD2_ITEMS_PER_SET]
-    print(f"[15개 후보] 방법2 첫 세트: {len(method2_top8)}개")
+    # 방법2 첫 세트 11개
+    method2_top11 = method2_all_sets[0] if method2_all_sets else []
+    if len(method2_top11) > METHOD2_ITEMS_PER_SET:
+        method2_top11 = method2_top11[:METHOD2_ITEMS_PER_SET]
+    print(f"[15개 후보] 방법2 첫 세트: {len(method2_top11)}개")
 
-    # 방법1 상위 7개 (안전하게 처리)
+    # 방법1 상위 4개 (안전하게 처리)
     if isinstance(method1_all_sets, list):
-        method1_top7 = method1_all_sets[:METHOD1_ITEMS_COUNT]
+        method1_top4 = method1_all_sets[:METHOD1_ITEMS_COUNT]
     else:
-        # 혹시 딕셔너리면 빈 리스트
-        method1_top7 = []
-    print(f"[15개 후보] 방법1 RRF 상위: {len(method1_top7)}개")
+        method1_top4 = []
+    print(f"[15개 후보] 방법1 RRF 상위: {len(method1_top4)}개")
 
-    # 8+7=15 합치고 중복 제거
-    combined_15 = method2_top8 + method1_top7
+    # 11+4=15 합치고 중복 제거(상품코드랑 상품제목을 같이 봄)
+    combined_15 = method2_top11 + method1_top4
     seen_codes_15, unique_15 = set(), []
     for item in combined_15:
         c = (item.get("상품코드") or "").strip().upper()
-        if c and c not in seen_codes_15:
-            seen_codes_15.add(c)
-            unique_15.append(item)
+        t = (item.get("제목") or "").strip()
+        if not c or not t:
+            continue     
+
+        # 제목 유사도 중복 체크(기존 fuzz_number 임계값 사용)
+        is_title_dup = any(fuzz.ratio(t, v.get("제목", "")) >= fuzz_number for v in unique_15)
+        if c in seen_codes_15 or is_title_dup:
+            continue
+
+        seen_codes_15.add(c)
+        unique_15.append(item)
     print(f"[15개 후보] 중복 제거 후: {len(unique_15)}개 (목표 15개)")
 
+
+
+
+
     # 🔥 백필: 15개 미달 시 방법2 Top1 카테고리 다음 순위로 채우기
-    method1_next_idx = METHOD1_ITEMS_COUNT  # 7 (다음 세트에서 사용할 시작 인덱스 추적)
-    top1_next_idx = METHOD2_TOP1_COUNT  # 3 (Top1에서 다음 사용할 인덱스)
-    
+    method1_next_idx = METHOD1_ITEMS_COUNT  # 4 (다음 세트에서 사용할 시작 인덱스 추적)
+    top1_next_idx = METHOD2_TOP1_COUNT      # 4 (Top1에서 다음 사용할 인덱스)
+
     if len(unique_15) < 15 and len(top1_list) > top1_next_idx:
         backfill_needed = 15 - len(unique_15)
         print(f"[15개 후보] {backfill_needed}개 부족 → 방법2 Top1 다음 순위로 백필")
@@ -3946,34 +3969,43 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             if backfilled_count >= backfill_needed:
                 break
             c = (item.get("상품코드") or "").strip().upper()
-            if c and c not in seen_codes_15:
-                seen_codes_15.add(c)
-                unique_15.append(item)
-                backfilled_count += 1
-                top1_next_idx += 1  # 사용한 만큼 인덱스 증가
+            t = (item.get("제목") or "").strip()
+            if not c or not t:
+                continue
+
+            # 제목 유사도 중복 체크(기존 fuzz_number 임계값 사용)
+            is_title_dup = any(fuzz.ratio(t, v.get("제목", "")) >= fuzz_number for v in unique_15)
+            if c in seen_codes_15 or is_title_dup:
+                continue
+
+            seen_codes_15.add(c)
+            unique_15.append(item)
+            backfilled_count += 1
+            top1_next_idx += 1
         
-        print(f"[15개 후보] 백필 완료: {backfilled_count}개 추가 → 총 {len(unique_15)}개")
-        print(f"[15개 후보] Top1 다음 시작 인덱스: {top1_next_idx}")
+        print(f"[15개 후보] 백필 완료: {backfilled_count}개 추가 (Top1 인덱스: {METHOD2_TOP1_COUNT} → {top1_next_idx})")
+
+    print(f"[15개 후보] 최종: {len(unique_15)}개")
 
 
     # ===== LLM 리랭킹: 15개 → 상위 10개 =====
-    def rerank_15_to_10(products_15, ranking_query: str):
+    def rerank_15_to_10(products_15, ranking_query: str, top1: str = None):
         if len(products_15) <= 10:
             return products_15[:10]
 
-
-        # 수정: 제목만 추출해서 LLM에 전달 (인덱스 유지)
+        # 제목만 추출해서 LLM에 전달 (인덱스 유지)
         products_text = "\n".join([
-            f"{i}. {p.get('제목', '제목없음')}"  # ✅ get() 사용으로 안전성 확보
+        f"{i}. {p.get('제목', '제목없음')}"
+
             for i, p in enumerate(products_15)
-        ])
+        ]) 
         
         ranking_prompt = f"""사용자 검색: "{ranking_query}"
 
         상품 목록:
         {products_text}
 
-        지시사항: 위 {len(products_15)}개 중 최적의 상위 10개 인덱스를 콤마로만 출력하세요.
+        지시사항: 상품제목인 위 {len(products_15)}개 중 사용자 검색과 추측한 카테고리인 {top1} 에 맞는 최적의 상위 10개 인덱스를 콤마로만 출력하세요.
         예: 2,0,5,1,8,3,7,4,9,6
         답변:"""
         try:
@@ -3995,7 +4027,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     picked.append(products_15[i]); used.add(i)
             # 부족하면 앞에서 채우기
             for i, p in enumerate(products_15):
-                if len(picked) >= 10: break
+                if len(picked) >= 10:
+                    break
                 if i not in used:
                     picked.append(p); used.add(i)
             return picked[:10]
@@ -4011,30 +4044,13 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     else:
         ranking_query = query
 
-    # 🔥 리랭킹 전 15개 상품 목록 출력
+    # 🔥 리랭킹 전 15개 상품 목록 출력 (세트 1)
     print(f"\n{'='*60}")
     print(f"📋 [세트 1 - 리랭킹 전] 15개 상품 목록:")
     print(f"{'='*60}")
     for idx, item in enumerate(unique_15, 1):
         print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
     print(f"{'='*60}\n")
-
-    final_10 = rerank_15_to_10(unique_15, ranking_query)
-    print(f"[LLM 리랭킹] 15개 → 10개 선택 완료")
-
-    # 🔥 리랭킹 후 10개 상품 목록 출력
-    print(f"\n{'='*60}")
-    print(f"🎯 [세트 1 - 리랭킹 후] 10개 상품 목록:")
-    print(f"{'='*60}")
-    for idx, item in enumerate(final_10, 1):
-        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
-    print(f"{'='*60}\n")
-
-
-    # ===== 세트1: 리랭킹된 10개 사용 =====
-    final_results = []
-    final_results.extend(final_10)
-    print(f"[세트 1] 리랭킹된 10개 사용 (누적 {len(final_results)}개)")
 
 
     # ===== 세트2: 방법2(4~6등 × 3카테고리) + 방법1(8~14등) = 15개 =====
@@ -4072,9 +4088,14 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     seen_codes_set2, unique_set2 = set(), []
     for item in set2_items:
         c = (item.get("상품코드") or "").strip().upper()
-        if c and c not in seen_codes_set2:
-            seen_codes_set2.add(c)
-            unique_set2.append(item)
+        t = (item.get("제목") or "").strip()
+        if not c or not t:
+            continue
+        is_title_dup = any(fuzz.ratio(t, v.get("제목", "")) >= fuzz_number for v in unique_set2)
+        if c in seen_codes_set2 or is_title_dup:
+            continue
+        seen_codes_set2.add(c)
+        unique_set2.append(item)
     
     print(f"[세트 2] 방법2({METHOD2_ITEMS_PER_SET}개) + 방법1({METHOD1_ITEMS_COUNT}개) = {len(unique_set2)}개 후보 생성")
     
@@ -4089,36 +4110,27 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             if backfilled_count >= backfill_needed:
                 break
             c = (item.get("상품코드") or "").strip().upper()
-            if c and c not in seen_codes_set2:
-                seen_codes_set2.add(c)
-                unique_set2.append(item)
-                backfilled_count += 1
-                top1_next_idx += 1  # 사용한 만큼 인덱스 증가
+            t = (item.get("제목") or "").strip()
+            if not c or not t:
+                continue
+            is_title_dup = any(fuzz.ratio(t, v.get("제목", "")) >= fuzz_number for v in unique_set2)
+            if c in seen_codes_set2 or is_title_dup:
+                continue
+            seen_codes_set2.add(c)
+            unique_set2.append(item)
+            backfilled_count += 1
+            top1_next_idx += 1
         
         print(f"[세트 2] 백필 완료: {backfilled_count}개 추가 → 총 {len(unique_set2)}개")
         print(f"[세트 2] Top1 다음 시작 인덱스: {top1_next_idx}")
     
-    # 🔥 리랭킹 전 15개 상품 목록 출력
+    # 🔥 리랭킹 전 15개 상품 목록 출력 (세트 2)
     print(f"\n{'='*60}")
     print(f"📋 [세트 2 - 리랭킹 전] 15개 상품 목록:")
     print(f"{'='*60}")
     for idx, item in enumerate(unique_set2, 1):
         print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
     print(f"{'='*60}\n")
-    
-    # 세트2 리랭킹 (15개 → 10개)
-    set2_final = rerank_15_to_10(unique_set2, ranking_query)
-    
-    # 🔥 리랭킹 후 10개 상품 목록 출력
-    print(f"\n{'='*60}")
-    print(f"🎯 [세트 2 - 리랭킹 후] 10개 상품 목록:")
-    print(f"{'='*60}")
-    for idx, item in enumerate(set2_final, 1):
-        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
-    print(f"{'='*60}\n")
-    
-    final_results.extend(set2_final)
-    print(f"[세트 2] 리랭킹 후 10개 추가 (누적 {len(final_results)}개)")
 
 
     # ===== 세트3: 방법2(7~9등 × 3카테고리) + 방법1(15~21등) = 15개 =====
@@ -4152,60 +4164,103 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     
     print(f"[세트 3] 방법1 사용 구간: [{set3_m1_start}:{set3_m1_end}] (인덱스)")
     
-    # 중복 제거
+    # 중복 제거 (상품코드 + 제목 유사도)
     seen_codes_set3, unique_set3 = set(), []
     for item in set3_items:
         c = (item.get("상품코드") or "").strip().upper()
-        if c and c not in seen_codes_set3:
-            seen_codes_set3.add(c)
-            unique_set3.append(item)
+        t = (item.get("제목") or "").strip()
+        if not c or not t:
+            continue
+        is_title_dup = any(fuzz.ratio(t, v.get("제목", "")) >= fuzz_number for v in unique_set3)
+        if c in seen_codes_set3 or is_title_dup:
+            continue
+        seen_codes_set3.add(c)
+        unique_set3.append(item)
     
     print(f"[세트 3] 방법2({METHOD2_ITEMS_PER_SET}개) + 방법1({METHOD1_ITEMS_COUNT}개) = {len(unique_set3)}개 후보 생성")
     
     # 🔥 백필: 15개 미달 시 방법2 Top1 카테고리 다음 순위로 채우기
     if len(unique_set3) < 15 and len(top1_list) > top1_next_idx:
         backfill_needed = 15 - len(unique_set3)
-        print(f"[세트 3] {backfill_needed}개 부족 → 방법2 Top1 다음 순위로 백필")
-        
+        print(f"[세트 3] {backfill_needed}개 부족 → Top1에서만 백필")
         backfilled_count = 0
-        
         for item in top1_list[top1_next_idx:]:
             if backfilled_count >= backfill_needed:
                 break
             c = (item.get("상품코드") or "").strip().upper()
-            if c and c not in seen_codes_set3:
-                seen_codes_set3.add(c)
-                unique_set3.append(item)
-                backfilled_count += 1
-                top1_next_idx += 1  # 사용한 만큼 인덱스 증가
+            t = (item.get("제목") or "").strip()
+            if not c or not t:
+                continue
+            is_title_dup = any(fuzz.ratio(t, v.get("제목", "")) >= fuzz_number for v in unique_set3)
+            if c in seen_codes_set3 or is_title_dup:
+                continue
+            seen_codes_set3.add(c)
+            unique_set3.append(item)
+            backfilled_count += 1
+            top1_next_idx += 1
         
         print(f"[세트 3] 백필 완료: {backfilled_count}개 추가 → 총 {len(unique_set3)}개")
         print(f"[세트 3] Top1 최종 사용 인덱스: {top1_next_idx}")
     
-    # 🔥 리랭킹 전 15개 상품 목록 출력
+    # 🔥 리랭킹 전 15개 상품 목록 출력 (세트 3)
     print(f"\n{'='*60}")
     print(f"📋 [세트 3 - 리랭킹 전] 15개 상품 목록:")
     print(f"{'='*60}")
     for idx, item in enumerate(unique_set3, 1):
         print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
     print(f"{'='*60}\n")
-    
-    # 세트3 리랭킹 (15개 → 10개)
-    set3_final = rerank_15_to_10(unique_set3, ranking_query)
-    
-    # 🔥 리랭킹 후 10개 상품 목록 출력
+
+
+    # =====🎯 세트1/2/3 LLM 리랭킹을 스레드풀로 동시에 실행 =====
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f1 = ex.submit(rerank_15_to_10, unique_15,   ranking_query, top1)
+        f2 = ex.submit(rerank_15_to_10, unique_set2, ranking_query, top1)
+        f3 = ex.submit(rerank_15_to_10, unique_set3, ranking_query, top1)
+
+        final_10   = f1.result()
+        set2_final = f2.result()
+        set3_final = f3.result()
+
+    print(f"[LLM 리랭킹] 세트1/2/3 병렬 리랭킹 완료")
+
+    # 🔥 리랭킹 후 10개 상품 목록 출력 (세트1)
+    print(f"\n{'='*60}")
+    print(f"🎯 [세트 1 - 리랭킹 후] 10개 상품 목록:")
+    print(f"{'='*60}")
+    for idx, item in enumerate(final_10, 1):
+        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
+    print(f"{'='*60}\n")
+
+    # 세트2
+    print(f"\n{'='*60}")
+    print(f"🎯 [세트 2 - 리랭킹 후] 10개 상품 목록:")
+    print(f"{'='*60}")
+    for idx, item in enumerate(set2_final, 1):
+        print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
+    print(f"{'='*60}\n")
+
+    # 세트3
     print(f"\n{'='*60}")
     print(f"🎯 [세트 3 - 리랭킹 후] 10개 상품 목록:")
     print(f"{'='*60}")
     for idx, item in enumerate(set3_final, 1):
         print(f"{idx}. {item.get('제목', '제목없음')} | {item.get('카테고리', '')} | {item.get('가격', 0):,}원")
     print(f"{'='*60}\n")
-    
+
+    # ===== 세트1/2/3 결과를 최종 리스트에 합치기 =====
+    final_results = []
+    final_results.extend(final_10)
+    print(f"[세트 1] 리랭킹된 10개 사용 (누적 {len(final_results)}개)")
+
+    final_results.extend(set2_final)
+    print(f"[세트 2] 리랭킹 후 10개 추가 (누적 {len(final_results)}개)")
+
     final_results.extend(set3_final)
     print(f"[세트 3] 리랭킹 후 10개 추가 (누적 {len(final_results)}개)")
 
-    
     print(f"\n[최종] 총 {len(final_results)}개 완성")
+
+
 
     # 검색 결과가 없으면 메시지 반환
     if len(final_results) == 0:
@@ -4225,7 +4280,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 for msg in session_history.messages
             ]
         }
-
 
 
 
