@@ -62,6 +62,128 @@ import functools
 import logging
 import uuid
 
+# Lingua 기반 언어 감지로 교체
+from lingua import Language, LanguageDetectorBuilder
+
+
+
+
+"""
+Lingua 언어 감지기 및 강제 언어 유틸 설정
+- 지원 언어: 한국어(ko), 영어(en), 중국어(zh), 일본어(ja), 베트남어(vi), 태국어(th), 러시아어(ru)
+"""
+SUPPORTED_LANGS = [
+    Language.KOREAN,
+    Language.ENGLISH,
+    Language.CHINESE,
+    Language.JAPANESE,
+    Language.VIETNAMESE,
+    Language.THAI,
+    Language.RUSSIAN,
+]
+
+LINGUA_DETECTOR = (
+    LanguageDetectorBuilder
+    .from_languages(*SUPPORTED_LANGS)
+    .with_preloaded_language_models()
+    .build()
+)
+
+# 출력 언어 표기 매핑 (응답 프롬프트에 사용)
+LANG_MAP = {
+    "ko": "한국어",
+    "en": "English",
+    "zh": "中文",
+    "ja": "日本語",
+    "vi": "Tiếng Việt",
+    "th": "ไทย",
+    "ru": "Русский",
+}
+
+def detect_language_code(text: str) -> str:
+    """Lingua 기반 언어 코드 감지. 짧은 텍스트는 확률값으로 판정.
+    반환값: ko/en/zh/ja/vi/th/ru 중 하나 (기본 en)
+    """
+    try:
+        t = (text or "").strip()
+        if not t:
+            return "en"
+        # 매우 짧은 입력은 확률값으로 판정
+        if len(t) < 4:
+            confidences = LINGUA_DETECTOR.compute_language_confidence_values(t)
+            if confidences:
+                best = max(confidences, key=lambda p: p.value)
+                return {
+                    Language.KOREAN: "ko",
+                    Language.ENGLISH: "en",
+                    Language.CHINESE: "zh",
+                    Language.JAPANESE: "ja",
+                    Language.VIETNAMESE: "vi",
+                    Language.THAI: "th",
+                    Language.RUSSIAN: "ru",
+                }.get(best.language, "en")
+            return "en"
+
+        lang = LINGUA_DETECTOR.detect_language_of(t)
+        return {
+            Language.KOREAN: "ko",
+            Language.ENGLISH: "en",
+            Language.CHINESE: "zh",
+            Language.JAPANESE: "ja",
+            Language.VIETNAMESE: "vi",
+            Language.THAI: "th",
+            Language.RUSSIAN: "ru",
+        }.get(lang, "en")
+    except Exception:
+        return "en"
+
+def _get_forced_lang(session_id: str) -> Optional[str]:
+    """웹훅에서 페이지별로 저장한 강제 언어(th 등)를 Redis에서 조회."""
+    try:
+        if not session_id:
+            return None
+        r = redis.from_url(REDIS_URL)
+        val = r.get(f"force_lang:{session_id}")
+        return val.decode("utf-8") if val else None
+    except Exception:
+        return None
+
+import secrets
+from user_events import event_manager
+from datetime import datetime
+from dotenv import load_dotenv
+
+import sqlite3
+from lightgcn_data_prep import LightGCNDataPreprocessor
+
+
+import hmac
+import hashlib
+
+from fastapi import  Cookie, Depends, status
+from fastapi.responses import RedirectResponse,PlainTextResponse, Response,FileResponse
+from langchain.schema import AIMessage, HumanMessage, SystemMessage
+from langchain_community.chat_message_histories import (
+    ChatMessageHistory,
+    RedisChatMessageHistory,
+)
+from langchain_core.chat_history import BaseChatMessageHistory
+import re, unicodedata, difflib
+from typing import Optional, Union, List, Dict, Any, Tuple, Iterable
+
+#가격인식 임포트
+from decimal import Decimal, InvalidOperation
+from rapidfuzz import fuzz
+
+import gc
+import sys
+from rank_categories import get_top_categories
+
+import asyncio
+import functools
+import logging
+import uuid
+
 
 executor = ThreadPoolExecutor()
 
@@ -1152,9 +1274,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     previous_queries = list(dict.fromkeys(previous_queries))
 
 
-    raw = detect(query)
-    lang_code = raw.lower().split("-")[0]
-    print("[Debug] lang_code →", lang_code)   # ← 이 줄 추가!
+    # 강제 언어 우선 적용 후 Lingua로 감지
+    forced = _get_forced_lang(session_id)
+    lang_code = forced.lower() if forced else detect_language_code(query)
+    print("[Debug] lang_code (forced/Lingua) →", lang_code)
 
     # 가격 조건 처리 함수
     def extract_price_condition(text: str) -> Optional[str]:
@@ -1426,28 +1549,29 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     print(f"[Debug] 최종 가격 조건: {price_cond if price_cond else '제한 없음'}")
 
 
-    # 2) 언어 코드 → 사람말 매핑
-    lang_map = {
-        "ko": "한국어",
-        "en": "English",
-        "zh": "中文",
-        "ja": "日本語",
-        "vi": "Tiếng Việt",  # 베트남어
-        "th": "ไทย",        # 태국어
+    # # 2) 언어 코드 → 사람말 매핑
+    # lang_map = {
+    #     "ko": "한국어",
+    #     "en": "English",
+    #     "zh": "中文",
+    #     "ja": "日本語",
+    #     "vi": "Tiếng Việt",  # 베트남어
+    #     "th": "ไทย",        # 태국어
+    #     "ru": "Русский",    # 러시아어
 
 
-        # "fr": "Français",
-        # "de": "Deutsch",
-        # "es": "Español",
-        # "it": "Italiano",
-        # "pt": "Português",
-        # "ar": "العربية",
-        # "fa": "فارسی",
-        # "he": "עברית",
-        # "sw": "Kiswahili",
-    }
+    #     # "fr": "Français",
+    #     # "de": "Deutsch",
+    #     # "es": "Español",
+    #     # "it": "Italiano",
+    #     # "pt": "Português",
+    #     # "ar": "العربية",
+    #     # "fa": "فارسی",
+    #     # "he": "עברית",
+    #     # "sw": "Kiswahili",
+    # }
 
-    target_lang = lang_map.get(lang_code, "English")
+    target_lang = LANG_MAP.get(lang_code, "English")
     print("[Debug] Detected language →", target_lang)
 
     # 시즌 판단
@@ -2038,7 +2162,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     - All string fields in the JSON (clarify_question, expanded_terms, notes, etc.)
         MUST NOT contain any emojis or emoticons.
-        Use only plain text words. (No emojis like 😊, 😂, ❤️ and no emoticons.)
+        Use only plain text words. (No emojis like 😊, 😂, ❤️, 😎and no emoticons.)
 
 
     Language rules
@@ -2190,6 +2314,11 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                                 - Use actual line breaks in the JSON string value.
                                 - Add ONE EXTRA line break between question and choices for better readability.
 
+                                # Additional Rules (Important):
+                                # - If four meaningful options are available, be sure to print them out as four (A, B, C, D).
+                                # - If 4 is possible, don't reduce it to 2/3. Only use 2 or 3 if 4 is really impossible.
+
+
                                 Format examples:
 
                                 "clarify_question": "It's a question about a binary choice.
@@ -2236,13 +2365,13 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             print(f"[LLM] expanded_terms: {intent_eval['expanded_terms']}")
 
         # 안내 문구를 언어에 따라 다르게 설정
-        notice_ko = "※ 선택지에 없는 경우 자유롭게 글로 서술해서 입력하셔도 됩니다."
-        notice_en = "※ If none of the choices fit, feel free to write your answer in your own words."
-        notice_zh = "※ 如果选项中没有合适的内容，可以自由用文字描述后输入。"
-        notice_ja = "※ 選択肢にない場合は、自由に文章で入力していただいて構いません。"
-        notice_vi = "※ Nếu không có lựa chọn nào phù hợp, bạn có thể tự do nhập câu trả lời bằng lời văn của mình."
-        notice_th = "※ หากไม่มีตัวเลือกใดที่ตรงกับคุณ คุณสามารถพิมพ์คำตอบเป็นข้อความได้อย่างอิสระ"
-        notice_ru = "※ Если ни один из вариантов не подходит, вы можете свободно ввести ответ в произвольной форме."
+        notice_ko = "※ A, B, C 등을 입력하시거나, 선택지에 없는 경우 자유롭게 답변을 서술해 주세요."
+        notice_en = "※ Just type A, B, C, etc., or write your answer in your own words if none of the choices fit."
+        notice_zh = "※ 请输入A、B、C等，如果选项中没有合适的内容，可以自由用文字描述您的答案。"
+        notice_ja = "※ A、B、Cなどを入力するか、選択肢にない場合は自由に文章でご回答ください。"
+        notice_vi = "※ Hãy nhập A, B, C, v.v., hoặc tự do viết câu trả lời bằng lời văn của bạn nếu không có lựa chọn nào phù hợp."
+        notice_th = "※ พิมพ์ A, B, C ฯลฯ หรือเขียนคำตอบเป็นข้อความของคุณเองหากไม่มีตัวเลือกใดที่ตรงกับคุณ"
+        notice_ru = "※ Введите A, B, C и т.д., или свободно напишите ответ своими словами, если ни один из вариантов не подходит."
 
         # target_lang은 이미 위에서 결정됨 target_lang 예시: "한국어", "English", "中文", "日本語", "Tiếng Việt", "ไทย", "Русский" 등 
         if target_lang == "한국어":
@@ -2916,7 +3045,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 4) 불필요한 종결어미 생략
                 5) 핵심 품목 불명확 시: **추정 금지, 원문 유지**
                 6) **부정/제외 표현(제외/빼고/말고/without 등) 금지.** 결과 문장은 제외 대상 자체를 언급하지 말 것.
-                7) 문장 제일 앞에 너가 추측해서 1등 일것 같은 카테고리 추가. 예시) 화과자, 베이컨, 밀가루
+                7) 반드시 “순수 한국어”만 사용. 영문/알파벳/기호/숫자 표기를 포함하지 말 것.
+                - 외래어/브랜드/영문 표기가 포함된 경우, 한국 쇼핑 맥락에서 통용되는 한글 표기로 자연스럽게 변환.
+                - 예: “pepsi” → “펩시”, “Maxim” → “맥심”, "Coca-Cola" → "코카콜라", "Nutella" → "누텔라"
+                8) 문장 제일 앞에 너가 추측해서 1등 일것 같은 카테고리 추가. 예시) 화과자, 베이컨, 밀가루
 
                 **올바른 예시:**
                 - "여름용 작은 가방" → "여름 작은 가방 입니다"
@@ -4286,57 +4418,70 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-
-
-
-
-
-
-
-
-
-
-
     # LLM 메시지 생성용 텍스트 (방법2 우선 표시)
     products_text = "\n".join([
         f"- 코드: {p['상품코드']} | 제목: {p['제목']} | 가격: {p['가격']:,}원 | 카테고리: {p['카테고리']}"
         for p in final_results[:10]  # 방법2(5개) + 방법1(5개) 순서
     ])
 
-    # 1) 템플릿을 바로 f-string으로
     prompt = f"""
-    **무조건 어떤 언어가 들어와도 {target_lang}로만 답변하세요!반드시**
+    **No matter what language the input is in, you must always respond only in {target_lang}!**
 
-    답변 언어는 무조건 {target_lang}로만 작성해주세요. 다른 언어, 혼합 표현 절대 금지.
-    당신은 고객의 니즈를 정확히 파악하는 프리미엄 온라인 쇼핑몰의 VIP 상품 추천 전문가입니다.
-    주어진 상품 목록을 바탕으로, 고객이 더 나은 선택을 할 수 있도록 도와주세요.
+    The answer language must always be {target_lang} only. Other languages or mixed expressions are strictly forbidden.
+    You are a VIP product recommendation expert at a premium online shopping mall who accurately understands customer needs.
+            
+    [CRITICALLY IMPORTANT - ROLE]
 
-    [매우 중요]
+    - Your role is not to describe each product in detail,
+    but to briefly show the customer what main types exist and how to choose between them.
 
-    - 고객이 원하는 상품을 정확히 찾을 수 있도록, 후보 상품의 특징을 활용해 고객의 선호를 파악하는 질문을 작성하세요.
+    [OUTPUT STYLE]
 
-    후보 상품 목록:
+    - The output format MUST follow this exact structure:
+
+    Line 1: one short sentence summarizing what product the customer is looking for and for what situation/purpose.
+            Line 1 MUST start with the phrase "It seems you're looking for".
+            (e.g., "It seems you're looking for children's shoes suitable for various daily activities and occasions.")
+    Line 2: a completely blank line.
+    Line 3 and below: 1–3 bullet lines, each starting with " - " (space, dash, space) and a short, polite phrase.
+
+
+    - Example format (do NOT copy literally, only follow the structure):
+    It seems you're looking for children's shoes suitable for various daily activities and occasions.
+
+        - lightweight boots suitable for everyday warmth and comfort
+        - waterproof boots designed for wet and slippery conditions
+        - rugged outdoor boots appropriate for extended use in harsher environments
+
+    - Each bullet line should describe one main type in the form:
+    "[type or usage] for [customer need or situation]".
+    - Do NOT add any extra sentences before or after the bullet list.
+    - Do NOT use numbered lists or other symbols, only " - " as shown.
+
+    Candidate product list:
     {products_text}
 
-    - 만약 고객이 "{preprocessed_query}"(을)를 찾고 있다면, 같은 상황에서 함께 고려할 수 있는 다른 상품(예: 비옷을 찾는다고 하면 비옷과 같은 레벨의 제품 우산,장화 등등 이런 제품은 어떤지 물어본다.)도 자연스럽게 “이런 상품도 있으니 어떠세요?” 식으로 한 문장으로 제안해 주세요. (단, 상품 리스트에는 포함하지 마세요.)
+    User intent:
+    {preprocessed_query}    
 
-    요청사항:
-    1) {preprocessed_query}의 문장을 이해하고 분석해서 고객 의도 확인과 선호 파악을 위한 '확인형 질문'을 반드시! 물어보는 답변이면 그 문장에 반드시 답변하세요!
+    Requirements:
+    1) Do not list specific model names or detailed specs; summarize only the key differences that matter to the customer.
+    2) Always use a polite, respectful tone (for English, a polite business tone),
+    and do not use emojis or special characters (e.g., 😂, 👍 etc.).
+    3) Length limits are important:
+    - Korean: 1 short sentence on line 1 + 1–3 short bullet lines, total preferably within 150 characters.
+    - English: 1 short sentence on line 1 + 1–3 short bullet lines, total preferably within 250 characters including spaces.
+    If needed, remove less important details and shorten each line to stay concise.
 
-
-    2) 상품 코드나 구체 모델명/스펙 나열은 금지합니다. 후보에서 추출한 '특징 키워드'만 요약해 언급하세요. preprocessed_query과 관련없는 상품이 있다면 없다고 설명해주는 문장을 생성하세요.
-    3) 친근하면서도 전문적인 대화체를 유지하세요.
-
-
-    **무조건 어떤 언어가 들어와도 {target_lang}로만 답변하세요**
-    **무조건 답변은 반드시 한글은 150자 이내 ,영어는 200자 이내로 자세하게 작성하되 요약본으로 답변을 작성하세요.
-
+    **No matter what language the input is in, you must always respond only in {target_lang}.**
+    **You must follow the line-break and bullet format above exactly.**
     """
+
 
     print("target_lang->", target_lang)
 
     # 2) 호출부 동일 (system에 실어 보내는 현재 구조 유지)
-    response = client.chat.completions.create(
+    response = client.chat.completions.create(                                                                                                                                                                                                                                                                                                                                  
         model=LLM_MODEL,
         messages=[{"role": "system", "content": prompt}],
         temperature=0
@@ -4344,7 +4489,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
     txt1 = response.choices[0].message.content or ""
     clean = txt1.strip()
-    print(f"[Top2-Stage] 전체 카테고리 추가 질문:\n{clean}\n")
+    print(f"[Top2-Stage] 결과 리스트 LLM 답변:\n{clean}\n")
 
     # 결과 출력
     print(f"\n총 {len(final_results)}개의 상품이 최종 리스트에 저장되었습니다.")
